@@ -229,7 +229,7 @@ function buildConfigPage(baseUrl) {
   h += '<button class="bg" id="impPlBtn" style="margin:0" onclick="doImport(\'playlist\')">Import Playlist</button>';
   h += '</div><div class="status" id="impStatus" style="margin-top:10px"></div>';
   h += '<div class="preview" id="impPreview"></div></div>';
-  h += '<footer>Claudochrome Eclipse Addon v1.6.0 &bull; Hi-Fi API v2.7</footer>';
+  h += '<footer>Claudochrome Eclipse Addon v1.7.0 &bull; Hi-Fi API v2.7</footer>';
   h += '<script>';
   h += 'var _gu="",_ru="";';
   h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";';
@@ -323,14 +323,14 @@ app.get('/instances', async function(_req, res) {
 });
 
 app.get('/health', function(_req, res) {
-  res.json({ status: 'ok', version: '1.6.0', hifiApiVersion: '2.7', activeInstance: activeInstance, instanceHealthy: instanceHealthy, activeTokens: TOKEN_CACHE.size, redisConnected: !!(redis && redis.status === 'ready'), timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '1.7.0', hifiApiVersion: '2.7', activeInstance: activeInstance, instanceHealthy: instanceHealthy, activeTokens: TOKEN_CACHE.size, redisConnected: !!(redis && redis.status === 'ready'), timestamp: new Date().toISOString() });
 });
 
 app.get('/u/:token/manifest.json', tokenMiddleware, function(req, res) {
   res.json({
     id:          'com.eclipse.claudochrome.' + req.params.token.slice(0, 8),
     name:        'Claudochrome (TIDAL)',
-    version:     '1.6.0',
+    version:     '1.7.0',
     description: 'Full TIDAL catalog via Hi-Fi API v2.7. Lossless FLAC, AAC 320. No account required.',
     icon:        'https://monochrome.tf/favicon.ico',
     resources:   ['search', 'stream', 'catalog'],
@@ -339,15 +339,13 @@ app.get('/u/:token/manifest.json', tokenMiddleware, function(req, res) {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SEARCH — parallel playlist search added
+// SEARCH
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
   var q = String(req.query.q || req.query.query || req.query.s || '').trim();
   console.log('[search] query received:', JSON.stringify(req.query), '→ q=', JSON.stringify(q));
 
-  if (!q) {
-    return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
-  }
+  if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
 
   try {
     var results = await Promise.allSettled([
@@ -389,42 +387,46 @@ app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
         if (a && a.id) {
           var arid = String(a.id);
           if (!artistMap[arid]) {
-            artistMap[arid] = {
-              id:         arid,
-              name:       a.name || 'Unknown',
-              artworkURL: coverUrl(a.picture, 320)
-            };
+            artistMap[arid] = { id: arid, name: a.name || 'Unknown', artworkURL: coverUrl(a.picture, 320) };
           }
         }
       }
 
       if (t.streamReady === false || t.allowStreaming === false) continue;
-
       tracks.push({
-        id:         String(t.id),
-        title:      t.title  || 'Unknown',
-        artist:     trackArtist(t),
-        album:      (t.album && t.album.title) || undefined,
-        duration:   trackDuration(t),
-        artworkURL: coverUrl(t.album && t.album.cover),
-        format:     'flac'
+        id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t),
+        album: (t.album && t.album.title) || undefined, duration: trackDuration(t),
+        artworkURL: coverUrl(t.album && t.album.cover), format: 'flac'
       });
     }
 
+    // Parse playlists — only keep entries that look like real TIDAL playlist UUIDs
     var plItems = [];
     if (plRaw) {
-      var rawPl = (plRaw.data && plRaw.data.items)             ? plRaw.data.items
-                : (plRaw.playlists && plRaw.playlists.items)   ? plRaw.playlists.items
-                : [];
-      plItems = rawPl.map(function(p) {
-        return {
-          id:         String(p.uuid || p.id || ''),
-          title:      p.title || 'Playlist',
-          creator:    (p.creator && p.creator.name) || undefined,
-          artworkURL: coverUrl(p.squareImage || p.image),
-          trackCount: p.numberOfTracks || undefined
-        };
-      }).filter(function(p) { return p.id && p.title; }).slice(0, 5);
+      console.log('[search] playlist raw keys:', Object.keys(plRaw));
+      var rawPl = [];
+      if      (plRaw.data  && plRaw.data.items)               rawPl = plRaw.data.items;
+      else if (plRaw.playlists && plRaw.playlists.items)       rawPl = plRaw.playlists.items;
+      else if (Array.isArray(plRaw.items))                     rawPl = plRaw.items;
+      else if (Array.isArray(plRaw.data))                      rawPl = plRaw.data;
+
+      plItems = rawPl
+        .filter(function(p) {
+          // Only include entries that have a uuid field OR a title that isn't a song title
+          // This prevents mis-identifying tracks as playlists
+          return p && (p.uuid || p.type === 'PLAYLIST' || (p.title && p.numberOfTracks > 0 && !p.duration));
+        })
+        .map(function(p) {
+          return {
+            id:         String(p.uuid || p.id || ''),
+            title:      p.title || 'Playlist',
+            creator:    (p.creator && p.creator.name) || undefined,
+            artworkURL: coverUrl(p.squareImage || p.image),
+            trackCount: p.numberOfTracks || undefined
+          };
+        })
+        .filter(function(p) { return p.id && p.title; })
+        .slice(0, 5);
     }
 
     var albumList  = Object.keys(albumMap).map(function(k) { return albumMap[k]; }).slice(0, 8);
@@ -489,23 +491,15 @@ app.get('/u/:token/album/:id', tokenMiddleware, async function(req, res) {
       var t = rawItems[i].item || rawItems[i];
       if (!t || !t.id || t.streamReady === false) continue;
       tracks.push({
-        id:          String(t.id),
-        title:       t.title || 'Unknown',
-        artist:      trackArtist(t) || artistName,
-        duration:    trackDuration(t),
-        trackNumber: t.trackNumber || (i + 1),
-        artworkURL:  coverUrl(album.cover)
+        id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t) || artistName,
+        duration: trackDuration(t), trackNumber: t.trackNumber || (i + 1), artworkURL: coverUrl(album.cover)
       });
     }
 
     res.json({
-      id:         String(album.id || aid),
-      title:      album.title || 'Unknown',
-      artist:     artistName,
-      artworkURL: coverUrl(album.cover, 640),
-      year:       (album.releaseDate || '').slice(0, 4) || undefined,
-      trackCount: album.numberOfTracks || tracks.length,
-      tracks:     tracks
+      id: String(album.id || aid), title: album.title || 'Unknown', artist: artistName,
+      artworkURL: coverUrl(album.cover, 640), year: (album.releaseDate || '').slice(0, 4) || undefined,
+      trackCount: album.numberOfTracks || tracks.length, tracks: tracks
     });
   } catch (e) {
     console.error('[album] ' + e.message);
@@ -514,49 +508,116 @@ app.get('/u/:token/album/:id', tokenMiddleware, async function(req, res) {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ARTIST — 4-strategy album fallback chain
+// ARTIST — exhaustive shape detection + search-based album fallback
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/u/:token/artist/:id', tokenMiddleware, async function(req, res) {
   var aid = parseInt(req.params.id, 10);
   if (isNaN(aid)) return res.status(400).json({ error: 'Invalid artist ID' });
   try {
-    var infoData   = await hifiGet('/artist/', { id: aid });
-    var artistInfo = infoData.artist || infoData.data || infoData;
-    var coverData  = infoData.cover  || {};
+    var infoData = await hifiGet('/artist/', { id: aid });
 
+    // Log the top-level keys so we can see the actual shape
+    console.log('[artist] response top-level keys:', Object.keys(infoData));
+    console.log('[artist] raw sample:', JSON.stringify(infoData).slice(0, 600));
+
+    // Extract artist info — try every known shape
+    var artistInfo = {};
+    if      (infoData.artist && infoData.artist.id)                        artistInfo = infoData.artist;
+    else if (infoData.data && infoData.data.artist && infoData.data.artist.id) artistInfo = infoData.data.artist;
+    else if (infoData.id && infoData.name)                                  artistInfo = infoData;
+    else if (infoData.data && infoData.data.id && infoData.data.name)      artistInfo = infoData.data;
+
+    var coverData = infoData.cover || {};
+
+    // Extract albums — try every known shape
     var albumItems = [];
-    if      (infoData.albums && infoData.albums.items)                            albumItems = infoData.albums.items;
-    else if (infoData.data && infoData.data.albums && infoData.data.albums.items) albumItems = infoData.data.albums.items;
+    var checkPaths = [
+      infoData.albums,
+      infoData.data && infoData.data.albums,
+      artistInfo.albums,
+      infoData.discography
+    ];
+    for (var cp = 0; cp < checkPaths.length; cp++) {
+      var candidate = checkPaths[cp];
+      if (!candidate) continue;
+      if (Array.isArray(candidate))         { albumItems = candidate; break; }
+      if (candidate.items && candidate.items.length) { albumItems = candidate.items; break; }
+    }
 
-    var allTracks = infoData.tracks || (infoData.data && infoData.data.tracks) || [];
+    // Extract tracks — try every known shape
+    var allTracks = [];
+    var trackPaths = [
+      infoData.topTracks,
+      infoData.tracks,
+      infoData.data && infoData.data.topTracks,
+      infoData.data && infoData.data.tracks,
+      artistInfo.topTracks,
+      artistInfo.tracks
+    ];
+    for (var tp = 0; tp < trackPaths.length; tp++) {
+      var tc = trackPaths[tp];
+      if (tc && Array.isArray(tc) && tc.length) { allTracks = tc; break; }
+      if (tc && tc.items && tc.items.length)     { allTracks = tc.items; break; }
+    }
 
-    // Strategy 2: f= discography param
+    // Strategy 2: discography via f= param
     if (!albumItems.length) {
       try {
         var discData = await hifiGet('/artist/', { f: aid, skip_tracks: false });
-        if (discData.albums && discData.albums.items) albumItems = discData.albums.items;
-        if (!allTracks.length) allTracks = discData.tracks || [];
-      } catch (e2) { console.log('[artist] disc call failed'); }
+        console.log('[artist] disc keys:', Object.keys(discData));
+        if      (discData.albums && Array.isArray(discData.albums))        albumItems = discData.albums;
+        else if (discData.albums && discData.albums.items)                  albumItems = discData.albums.items;
+        if (!allTracks.length && discData.tracks) allTracks = Array.isArray(discData.tracks) ? discData.tracks : (discData.tracks.items || []);
+      } catch (e2) { console.log('[artist] disc call failed:', e2.message); }
     }
 
-    // Strategy 3: dedicated /artist/albums/ endpoint
+    // Strategy 3: /artist/albums/ endpoint
     if (!albumItems.length) {
       try {
         var albData = await hifiGet('/artist/albums/', { id: aid, limit: 50, offset: 0 });
-        albumItems = albData.items                       ? albData.items
-                   : (albData.data && albData.data.items) ? albData.data.items
+        albumItems = Array.isArray(albData)                 ? albData
+                   : (albData.items)                       ? albData.items
+                   : (albData.data && Array.isArray(albData.data)) ? albData.data
+                   : (albData.data && albData.data.items)  ? albData.data.items
                    : [];
-      } catch (e3) { console.log('[artist] /artist/albums/ failed'); }
+      } catch (e3) { console.log('[artist] /artist/albums/ failed:', e3.message); }
     }
 
     // Strategy 4: /albums/ with artist filter
     if (!albumItems.length) {
       try {
         var albData2 = await hifiGet('/albums/', { artist: aid, limit: 50, offset: 0 });
-        albumItems = albData2.items                        ? albData2.items
-                   : (albData2.data && albData2.data.items) ? albData2.data.items
+        albumItems = Array.isArray(albData2)                   ? albData2
+                   : (albData2.items)                         ? albData2.items
+                   : (albData2.data && Array.isArray(albData2.data))  ? albData2.data
+                   : (albData2.data && albData2.data.items)   ? albData2.data.items
                    : [];
-      } catch (e4) { console.log('[artist] /albums/ filter failed'); }
+      } catch (e4) { console.log('[artist] /albums/ filter failed:', e4.message); }
+    }
+
+    // Strategy 5: search-based fallback — reliable since search always works
+    if (!albumItems.length && artistInfo.name) {
+      try {
+        console.log('[artist] trying search fallback for albums, artist:', artistInfo.name);
+        var sData = await hifiGet('/search/', { s: artistInfo.name, limit: 20, offset: 0 });
+        var sItems = (sData && sData.data && sData.data.items) ? sData.data.items : [];
+        var albumMap = {};
+        sItems.forEach(function(t) {
+          if (!t || !t.album || !t.album.id) return;
+          var tArtistName = trackArtist(t).toLowerCase();
+          var wantedName  = (artistInfo.name || '').toLowerCase();
+          // Only include albums where artist name roughly matches
+          if (tArtistName.indexOf(wantedName) === -1 && wantedName.indexOf(tArtistName) === -1) return;
+          var alId = String(t.album.id);
+          if (!albumMap[alId]) albumMap[alId] = {
+            id: alId, title: t.album.title || 'Unknown',
+            cover: t.album.cover, releaseDate: t.album.releaseDate,
+            numberOfTracks: t.album.numberOfTracks
+          };
+        });
+        albumItems = Object.values(albumMap);
+        console.log('[artist] search fallback found', albumItems.length, 'albums');
+      } catch (e5) { console.log('[artist] search fallback failed:', e5.message); }
     }
 
     var artworkURL = coverData['750'] || coverUrl(artistInfo.picture, 480);
@@ -590,14 +651,40 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async function(req, res) {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PLAYLIST
+// PLAYLIST — exhaustive shape detection
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/u/:token/playlist/:id', tokenMiddleware, async function(req, res) {
   var pid = req.params.id;
   try {
-    var data     = await hifiGet('/playlist/', { id: pid, limit: 100, offset: 0 });
-    var pl       = data.playlist || (data.data && data.data.playlist) || data.data || data;
-    var rawItems = data.items || (pl && pl.items) || [];
+    var data = await hifiGet('/playlist/', { id: pid, limit: 100, offset: 0 });
+
+    // Log raw shape for debugging
+    console.log('[playlist] response top-level keys:', Object.keys(data));
+    console.log('[playlist] raw sample:', JSON.stringify(data).slice(0, 400));
+
+    // Extract playlist metadata — try every known shape
+    var pl       = null;
+    var rawItems = [];
+
+    if (data.playlist && (data.playlist.uuid || data.playlist.id)) {
+      pl       = data.playlist;
+      rawItems = data.items || data.playlist.items || [];
+    } else if (data.data && data.data.playlist) {
+      pl       = data.data.playlist;
+      rawItems = data.data.items || data.items || [];
+    } else if (data.uuid || (data.title && data.numberOfTracks !== undefined)) {
+      pl       = data;
+      rawItems = data.items || [];
+    } else if (data.data && (data.data.uuid || data.data.title)) {
+      pl       = data.data;
+      rawItems = data.data.items || data.items || [];
+    } else {
+      // Last resort: treat entire response as playlist
+      pl       = data;
+      rawItems = data.items || [];
+    }
+
+    console.log('[playlist] pl title:', pl && pl.title, '| rawItems count:', rawItems.length);
 
     var tracks = [];
     for (var i = 0; i < rawItems.length; i++) {
@@ -607,11 +694,11 @@ app.get('/u/:token/playlist/:id', tokenMiddleware, async function(req, res) {
     }
 
     res.json({
-      id:         String(pl.uuid || pl.id || pid),
-      title:      pl.title || 'Playlist',
-      creator:    (pl.creator && pl.creator.name) || undefined,
-      artworkURL: pl.squareImage ? coverUrl(pl.squareImage, 480) : undefined,
-      trackCount: pl.numberOfTracks || tracks.length,
+      id:         String((pl && (pl.uuid || pl.id)) || pid),
+      title:      (pl && pl.title) || 'Playlist',
+      creator:    (pl && pl.creator && pl.creator.name) || undefined,
+      artworkURL: (pl && pl.squareImage) ? coverUrl(pl.squareImage, 480) : (pl && pl.image ? coverUrl(pl.image, 480) : undefined),
+      trackCount: (pl && pl.numberOfTracks) || tracks.length,
       tracks:     tracks
     });
   } catch (e) {
@@ -657,5 +744,5 @@ app.get('/u/:token/import-csv', tokenMiddleware, async function(req, res) {
 });
 
 app.listen(PORT, function() {
-  console.log('Claudochrome v1.6.0 (Hi-Fi API v2.7) on port ' + PORT);
+  console.log('Claudochrome v1.7.0 (Hi-Fi API v2.7) on port ' + PORT);
 });
