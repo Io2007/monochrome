@@ -20,7 +20,6 @@ const HIFI_INSTANCES = [
 ];
 let activeInstance  = HIFI_INSTANCES[0];
 let instanceHealthy = false;
-const COUNTRY = process.env.TIDAL_COUNTRY || 'US';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -31,27 +30,40 @@ function coverUrl(uuid, size) {
   size = size || 320;
   return 'https://resources.tidal.com/images/' + s.replace(/-/g, '/') + '/' + size + 'x' + size + '.jpg';
 }
+function trackDuration(t) { return (t && t.duration) ? Math.floor(t.duration) : undefined; }
 function trackArtist(t) {
   if (!t) return 'Unknown';
-  if (t.artists && t.artists.length) return t.artists.map(function(a){ return a.name; }).join(', ');
-  if (t.artist  && t.artist.name)    return t.artist.name;
+  if (t.artists && t.artists.length) return t.artists.map(function(a) { return a.name; }).join(', ');
+  if (t.artist  && t.artist.name)   return t.artist.name;
   return 'Unknown';
 }
 function decodeManifest(manifest) {
   try {
-    var d = JSON.parse(Buffer.from(manifest, 'base64').toString('utf8'));
-    return { url: (d.urls && d.urls[0]) || null, codec: d.codecs || d.mimeType || '' };
+    var decoded = JSON.parse(Buffer.from(manifest, 'base64').toString('utf8'));
+    return { url: (decoded.urls && decoded.urls[0]) || null, codec: decoded.codecs || decoded.mimeType || '' };
   } catch (e) { return null; }
 }
 function isPlaylistUUID(id) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(id || ''));
 }
+// Detect if an object is a real playlist vs a track
+function looksLikePlaylist(p) {
+  if (!p || !p.title) return false;
+  // Real playlists have uuid, creator, squareImage, numberOfTracks but NO trackNumber/replayGain/peak
+  if (p.trackNumber !== undefined) return false;
+  if (p.replayGain  !== undefined) return false;
+  if (p.peak        !== undefined) return false;
+  if (p.isrc        !== undefined) return false;
+  if (p.audioQuality !== undefined) return false;
+  // Must have something playlist-like
+  return !!(p.uuid || p.creator || p.squareImage || p.numberOfTracks !== undefined);
+}
 
 // ─── Hi-Fi API client ─────────────────────────────────────────────────────────
 async function hifiGet(path, params) {
-  var errors = [];
+  var errors    = [];
   var instances = instanceHealthy
-    ? [activeInstance].concat(HIFI_INSTANCES.filter(function(i){ return i !== activeInstance; }))
+    ? [activeInstance].concat(HIFI_INSTANCES.filter(function(i) { return i !== activeInstance; }))
     : HIFI_INSTANCES.slice();
   for (var inst of instances) {
     try {
@@ -68,15 +80,14 @@ async function hifiGet(path, params) {
   }
   throw new Error('All Hi-Fi instances failed: ' + errors.slice(-2).join(' | '));
 }
+async function hifiGetSafe(path, params) {
+  try { return await hifiGet(path, params); } catch (e) { return null; }
+}
 
-// Health check uses /search/?s= — lightweight ping all instances respond to
 async function checkInstances() {
   for (var inst of HIFI_INSTANCES) {
     try {
-      await axios.get(inst + '/search/', {
-        params: { s: 'test', limit: 1 },
-        headers: { 'User-Agent': UA }, timeout: 8000
-      });
+      await axios.get(inst + '/search/', { params: { s: 'test', limit: 1 }, timeout: 8000 });
       activeInstance = inst; instanceHealthy = true; console.log('[hifi] healthy: ' + inst); return;
     } catch (e) {}
   }
@@ -89,8 +100,8 @@ setInterval(checkInstances, 15 * 60 * 1000);
 let redis = null;
 if (process.env.REDIS_URL) {
   redis = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: 3, enableReadyCheck: false });
-  redis.on('connect', function(){ console.log('[Redis] connected'); });
-  redis.on('error',   function(e){ console.error('[Redis] ' + e.message); });
+  redis.on('connect', function() { console.log('[Redis] connected'); });
+  redis.on('error',   function(e) { console.error('[Redis] ' + e.message); });
 }
 async function redisSave(token, entry) {
   if (!redis) return;
@@ -119,13 +130,13 @@ async function getTokenEntry(token) {
 }
 function checkRateLimit(entry) {
   var now = Date.now();
-  entry.rateWin = (entry.rateWin || []).filter(function(t){ return now - t < RATE_WINDOW_MS; });
+  entry.rateWin = (entry.rateWin || []).filter(function(t) { return now - t < RATE_WINDOW_MS; });
   if (entry.rateWin.length >= RATE_MAX) return false;
   entry.rateWin.push(now); entry.lastUsed = now; entry.reqCount = (entry.reqCount || 0) + 1; return true;
 }
 async function tokenMiddleware(req, res, next) {
   var entry = await getTokenEntry(req.params.token);
-  if (!entry)                 return res.status(404).json({ error: 'Invalid token.' });
+  if (!entry)                return res.status(404).json({ error: 'Invalid token.' });
   if (!checkRateLimit(entry)) return res.status(429).json({ error: 'Rate limit exceeded.' });
   req.tokenEntry = entry;
   if (entry.reqCount % 20 === 0) redisSave(req.params.token, entry);
@@ -174,7 +185,7 @@ function buildConfigPage(baseUrl) {
   h += '<div class="card"><h1>Claudochrome for Eclipse</h1>';
   h += '<p class="sub">Full TIDAL catalog — lossless FLAC, HiRes, AAC 320 — no account, no subscription.</p>';
   h += '<div class="tip"><b>Save your URL.</b> Paste it below to refresh without reinstalling.</div>';
-  h += '<div class="pills"><span class="pill">Tracks &middot; Albums &middot; Artists &middot; Playlists</span><span class="pill hi">FLAC / HiRes</span><span class="pill hi">AAC 320</span></div>';
+  h += '<div class="pills"><span class="pill">Tracks &middot; Albums &middot; Artists</span><span class="pill hi">FLAC / HiRes</span><span class="pill hi">AAC 320</span></div>';
   h += '<button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
   h += '<div class="box" id="genBox"><div class="blbl">Your addon URL &mdash; paste into Eclipse</div><div class="burl" id="genUrl"></div><button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button></div>';
   h += '<hr><div class="lbl">Refresh existing URL</div>';
@@ -192,7 +203,7 @@ function buildConfigPage(baseUrl) {
   h += '<p class="sub" style="margin-bottom:14px">Live status of all Hi-Fi API v2.7 instances.</p>';
   h += '<div class="inst-list" id="instList"><div style="color:#333;font-size:13px">Checking...</div></div>';
   h += '<button class="bg" style="margin-top:14px" onclick="checkHealth()">Refresh Status</button></div>';
-  h += '<footer>Claudochrome Eclipse Addon v2.1.1 &bull; Hi-Fi API v2.7</footer>';
+  h += '<footer>Claudochrome Eclipse Addon v2.0.0 &bull; Hi-Fi API v2.7</footer>';
   h += '<script>var _gu="",_ru="";';
   h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";';
   h += 'fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}';
@@ -208,7 +219,7 @@ function buildConfigPage(baseUrl) {
   return h;
 }
 
-// ─── Public routes ─────────────────────────────────────────────────────────────
+// ─── Public routes ────────────────────────────────────────────────────────────
 app.get('/', function(req, res) { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.send(buildConfigPage(getBaseUrl(req))); });
 
 app.post('/generate', async function(req, res) {
@@ -234,27 +245,22 @@ app.post('/refresh', async function(req, res) {
 app.get('/instances', async function(_req, res) {
   var results = await Promise.all(HIFI_INSTANCES.map(async function(inst) {
     var start = Date.now();
-    try {
-      await axios.get(inst + '/search/', {
-        params: { s: 'test', limit: 1 },
-        headers: { 'User-Agent': UA }, timeout: 6000
-      });
-      return { url: inst, ok: true, ms: Date.now() - start };
-    } catch (e) { return { url: inst, ok: false, ms: null }; }
+    try { await axios.get(inst + '/search/', { params: { s: 'test', limit: 1 }, timeout: 6000 }); return { url: inst, ok: true, ms: Date.now() - start }; }
+    catch (e) { return { url: inst, ok: false, ms: null }; }
   }));
   res.json({ instances: results });
 });
 
 app.get('/health', function(_req, res) {
-  res.json({ status: 'ok', version: '2.1.1', activeInstance: activeInstance, instanceHealthy: instanceHealthy, activeTokens: TOKEN_CACHE.size, redisConnected: !!(redis && redis.status === 'ready'), timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '2.0.0', activeInstance: activeInstance, instanceHealthy: instanceHealthy, activeTokens: TOKEN_CACHE.size, redisConnected: !!(redis && redis.status === 'ready'), timestamp: new Date().toISOString() });
 });
 
-// ─── Manifest ──────────────────────────────────────────────────────────────────
+// ─── Manifest ─────────────────────────────────────────────────────────────────
 app.get('/u/:token/manifest.json', tokenMiddleware, function(req, res) {
   res.json({
     id:          'com.eclipse.claudochrome.' + req.params.token.slice(0, 8),
     name:        'Claudochrome (TIDAL)',
-    version:     '2.1.1',
+    version:     '2.0.0',
     description: 'Full TIDAL catalog via Hi-Fi API v2.7. Lossless FLAC, AAC 320. No account required.',
     icon:        'https://monochrome.tf/favicon.ico',
     resources:   ['search', 'stream', 'catalog'],
@@ -262,109 +268,107 @@ app.get('/u/:token/manifest.json', tokenMiddleware, function(req, res) {
   });
 });
 
-// ─── Search ────────────────────────────────────────────────────────────────────
-// /v1/search returns four separate buckets: tracks, albums, artists, playlists
-// /search/ (old) ignores type filters and always returns tracks only
+// ─── Search ───────────────────────────────────────────────────────────────────
 app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
-  var q = String(req.query.q || req.query.query || '').trim();
+  var q = String(req.query.q || req.query.query || req.query.s || '').trim();
   console.log('[search] q:', JSON.stringify(q));
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
 
   try {
-    var r = await hifiGet('/v1/search', {
-      query:       q,
-      types:       'TRACKS,ALBUMS,ARTISTS,PLAYLISTS',
-      limit:       20,
-      countryCode: COUNTRY
-    });
+    // Run main search + all playlist endpoint candidates in parallel
+    var [mainResult, pl1, pl2, pl3, pl4, pl5] = await Promise.allSettled([
+      hifiGet('/search/', { s: q, limit: 20, offset: 0 }),
+      // Try every known playlist search pattern
+      hifiGetSafe('/search/', { s: q, type: 'PLAYLISTS', limit: 10, offset: 0 }),
+      hifiGetSafe('/search/', { s: q, types: 'PLAYLISTS', limit: 10, offset: 0 }),
+      hifiGetSafe('/search/', { s: q, filter: 'PLAYLISTS', limit: 10, offset: 0 }),
+      hifiGetSafe('/playlists/search/', { s: q, limit: 10, offset: 0 }),
+      hifiGetSafe('/search/playlists/', { s: q, limit: 10, offset: 0 })
+    ]);
 
-    // Proxy may wrap in { version, data } or return flat — handle both shapes
-    var d = (r && r.data && (r.data.tracks || r.data.albums || r.data.artists || r.data.playlists)) ? r.data : r;
-    console.log('[search] response keys:', Object.keys(d));
+    var data  = mainResult.status === 'fulfilled' ? mainResult.value : null;
+    var items = (data && data.data && data.data.items) ? data.data.items : [];
+    console.log('[search] got', items.length, 'items');
 
-    var trackItems    = (d.tracks    && d.tracks.items)    || [];
-    var albumItems    = (d.albums    && d.albums.items)    || [];
-    var artistItems   = (d.artists   && d.artists.items)   || [];
-    var playlistItems = (d.playlists && d.playlists.items) || [];
+    var albumMap = {}, artistMap = {}, tracks = [];
 
-    console.log('[search] raw — tracks:', trackItems.length, 'albums:', albumItems.length, 'artists:', artistItems.length, 'playlists:', playlistItems.length);
+    for (var i = 0; i < items.length; i++) {
+      var t = items[i];
+      if (!t || !t.id) continue;
 
-    var tracks = trackItems
-      .filter(function(t){ return t && t.id && t.streamReady !== false && t.allowStreaming !== false; })
-      .map(function(t){
-        return {
-          id:         String(t.id),
-          title:      t.title || 'Unknown',
-          artist:     trackArtist(t),
-          album:      (t.album && t.album.title) || undefined,
-          duration:   t.duration ? Math.floor(t.duration) : undefined,
-          artworkURL: coverUrl(t.album && t.album.cover),
-          isrc:       t.isrc || undefined,
-          format:     'flac'
-        };
-      });
+      if (t.album && t.album.id) {
+        var abid = String(t.album.id);
+        if (!albumMap[abid]) albumMap[abid] = { id: abid, title: t.album.title || 'Unknown', artist: trackArtist(t), artworkURL: coverUrl(t.album.cover), trackCount: t.album.numberOfTracks || undefined, year: t.album.releaseDate ? String(t.album.releaseDate).slice(0, 4) : undefined };
+      }
 
-    var albums = albumItems
-      .filter(function(a){ return a && a.id; }).slice(0, 8)
-      .map(function(a){
-        return {
-          id:         String(a.id),
-          title:      a.title || 'Unknown',
-          artist:     (a.artist && a.artist.name) || (a.artists && a.artists[0] && a.artists[0].name) || 'Unknown',
-          artworkURL: coverUrl(a.cover),
-          trackCount: a.numberOfTracks || undefined,
-          year:       a.releaseDate ? String(a.releaseDate).slice(0, 4) : undefined
-        };
-      });
+      var arts = t.artists || (t.artist ? [t.artist] : []);
+      for (var j = 0; j < arts.length; j++) {
+        var a = arts[j];
+        if (a && a.id) { var arid = String(a.id); if (!artistMap[arid]) artistMap[arid] = { id: arid, name: a.name || 'Unknown', artworkURL: coverUrl(a.picture, 320) }; }
+      }
 
-    var artists = artistItems
-      .filter(function(a){ return a && a.id && a.name; }).slice(0, 5)
-      .map(function(a){
-        return { id: String(a.id), name: a.name, artworkURL: coverUrl(a.picture, 320) };
-      });
+      if (t.streamReady === false || t.allowStreaming === false) continue;
+      tracks.push({ id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t), album: (t.album && t.album.title) || undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album && t.album.cover), format: 'flac' });
+    }
 
-    // Real TIDAL playlists have uuid + numberOfTracks but never trackNumber/replayGain/isrc/audioQuality
-    var playlists = playlistItems
-      .filter(function(p){
-        if (!p || !p.title)                return false;
-        if (p.trackNumber  !== undefined)  return false;
-        if (p.replayGain   !== undefined)  return false;
-        if (p.audioQuality !== undefined)  return false;
-        if (p.isrc         !== undefined)  return false;
-        return !!(p.uuid || p.numberOfTracks !== undefined);
-      })
-      .slice(0, 5)
-      .map(function(p){
-        return {
-          id:         String(p.uuid || p.id || ''),
-          title:      p.title,
-          creator:    (p.creator && p.creator.name) || undefined,
-          artworkURL: coverUrl(p.squareImage || p.image, 320),
-          trackCount: p.numberOfTracks || undefined
-        };
-      })
-      .filter(function(p){ return !!p.id; });
+    // ── Playlist discovery: check every candidate response ──
+    var plItems = [];
+    var plCandidates = [pl1, pl2, pl3, pl4, pl5];
+    var plLabels     = ['type=PLAYLISTS', 'types=PLAYLISTS', 'filter=PLAYLISTS', '/playlists/search/', '/search/playlists/'];
 
-    console.log('[search] returning tracks:', tracks.length, 'albums:', albums.length, 'artists:', artists.length, 'playlists:', playlists.length);
-    res.json({ tracks: tracks, albums: albums, artists: artists, playlists: playlists });
+    for (var ci = 0; ci < plCandidates.length; ci++) {
+      var candidate = plCandidates[ci];
+      if (candidate.status !== 'fulfilled' || !candidate.value) continue;
+      var raw = candidate.value;
+
+      // Log what each endpoint actually returned so we can see the shape
+      console.log('[playlist-search] endpoint "' + plLabels[ci] + '" top keys:', Object.keys(raw));
+
+      // Extract items from every known shape
+      var rawItems = [];
+      if      (raw.data && raw.data.playlists && Array.isArray(raw.data.playlists.items)) rawItems = raw.data.playlists.items;
+      else if (raw.data && raw.data.playlists && Array.isArray(raw.data.playlists))        rawItems = raw.data.playlists;
+      else if (raw.data && raw.data.items && Array.isArray(raw.data.items))                rawItems = raw.data.items;
+      else if (raw.playlists && Array.isArray(raw.playlists.items))                        rawItems = raw.playlists.items;
+      else if (raw.playlists && Array.isArray(raw.playlists))                              rawItems = raw.playlists;
+      else if (Array.isArray(raw.items))                                                   rawItems = raw.items;
+      else if (Array.isArray(raw.data))                                                    rawItems = raw.data;
+
+      if (rawItems.length > 0) {
+        console.log('[playlist-search] "' + plLabels[ci] + '" returned', rawItems.length, 'items, first keys:', Object.keys(rawItems[0]));
+      }
+
+      // Only keep real playlist objects — reject anything that looks like a track
+      var realPlaylists = rawItems.filter(looksLikePlaylist);
+      console.log('[playlist-search] "' + plLabels[ci] + '" real playlists after filter:', realPlaylists.length);
+
+      if (realPlaylists.length > 0) {
+        plItems = realPlaylists.slice(0, 5).map(function(p) {
+          return { id: String(p.uuid || p.id || ''), title: p.title || 'Playlist', creator: (p.creator && p.creator.name) || undefined, artworkURL: coverUrl(p.squareImage || p.image), trackCount: p.numberOfTracks || undefined };
+        }).filter(function(p) { return p.id; });
+        if (plItems.length > 0) break; // found real playlists, stop trying
+      }
+    }
+
+    var albumList  = Object.keys(albumMap).map(function(k) { return albumMap[k]; }).slice(0, 8);
+    var artistList = Object.keys(artistMap).map(function(k) { return artistMap[k]; }).slice(0, 5);
+
+    console.log('[search] returning tracks:', tracks.length, 'albums:', albumList.length, 'artists:', artistList.length, 'playlists:', plItems.length);
+    res.json({ tracks: tracks, albums: albumList, artists: artistList, playlists: plItems });
 
   } catch (e) {
     console.error('[search] ERROR:', e.message);
-    res.status(502).json({ error: 'Search failed', tracks: [], albums: [], artists: [], playlists: [] });
+    res.status(502).json({ error: 'Search failed: ' + e.message, tracks: [], albums: [], artists: [], playlists: [] });
   }
 });
 
-// ─── Stream ────────────────────────────────────────────────────────────────────
+// ─── Stream ───────────────────────────────────────────────────────────────────
 app.get('/u/:token/stream/:id', tokenMiddleware, async function(req, res) {
-  var tid = req.params.id;
-  var qualities = ['LOSSLESS', 'HIGH', 'LOW'];
+  var tid = req.params.id, qualities = ['LOSSLESS', 'HIGH', 'LOW'];
   for (var qi = 0; qi < qualities.length; qi++) {
     var ql = qualities[qi];
     try {
-      var data = await hifiGet('/v1/tracks/' + tid + '/streamUrl', {
-        soundQuality: ql,
-        countryCode:  COUNTRY
-      });
+      var data = await hifiGet('/track/', { id: tid, quality: ql });
       var payload = (data && data.data) ? data.data : data;
       if (payload && payload.manifest) {
         var decoded = decodeManifest(payload.manifest);
@@ -373,9 +377,7 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async function(req, res) {
           return res.json({ url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: ql === 'LOSSLESS' ? 'lossless' : (ql === 'HIGH' ? '320kbps' : '128kbps'), expiresAt: Math.floor(Date.now() / 1000) + 21600 });
         }
       }
-      if (payload && payload.url) {
-        return res.json({ url: payload.url, format: 'aac', quality: 'lossless', expiresAt: Math.floor(Date.now() / 1000) + 21600 });
-      }
+      if (payload && payload.url) return res.json({ url: payload.url, format: 'aac', quality: 'lossless', expiresAt: Math.floor(Date.now() / 1000) + 21600 });
     } catch (e) {
       if (qi === qualities.length - 1) { console.error('[stream] all qualities failed for ' + tid + ': ' + e.message); return res.status(502).json({ error: 'Could not get stream URL for track ' + tid }); }
     }
@@ -383,66 +385,120 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async function(req, res) {
   return res.status(404).json({ error: 'No stream found for track ' + tid });
 });
 
-// ─── Album ─────────────────────────────────────────────────────────────────────
+// ─── Album ────────────────────────────────────────────────────────────────────
 app.get('/u/:token/album/:id', tokenMiddleware, async function(req, res) {
   var aid = req.params.id;
   try {
-    var infoData   = await hifiGet('/v1/albums/' + aid, { countryCode: COUNTRY });
-    var tracksData = await hifiGet('/v1/albums/' + aid + '/tracks', { countryCode: COUNTRY, limit: 100 });
-    var album      = (infoData.data)   ? infoData.data   : infoData;
-    var rawItems   = (tracksData.data && tracksData.data.items) ? tracksData.data.items : (tracksData.items || []);
-    var artistName = (album.artist && album.artist.name) || (album.artists && album.artists[0] && album.artists[0].name) || 'Unknown';
-    var tracks = rawItems
-      .filter(function(t){ return t && t.id && t.streamReady !== false; })
-      .map(function(t, i){
-        return { id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t) || artistName, duration: t.duration ? Math.floor(t.duration) : undefined, trackNumber: t.trackNumber || (i + 1), artworkURL: coverUrl(album.cover) };
-      });
+    var data = await hifiGet('/album/', { id: aid, limit: 100, offset: 0 });
+    var album = (data && data.data) ? data.data : data;
+    var rawItems = album.items || [];
+    var artistName = 'Unknown';
+    if      (album.artist  && album.artist.name)   artistName = album.artist.name;
+    else if (album.artists && album.artists.length) artistName = album.artists.map(function(a) { return a.name; }).join(', ');
+    var tracks = [];
+    for (var i = 0; i < rawItems.length; i++) {
+      var t = rawItems[i].item || rawItems[i];
+      if (!t || !t.id || t.streamReady === false) continue;
+      tracks.push({ id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t) || artistName, duration: trackDuration(t), trackNumber: t.trackNumber || (i + 1), artworkURL: coverUrl(album.cover) });
+    }
     res.json({ id: String(album.id || aid), title: album.title || 'Unknown', artist: artistName, artworkURL: coverUrl(album.cover, 640), year: (album.releaseDate || '').slice(0, 4) || undefined, trackCount: album.numberOfTracks || tracks.length, tracks: tracks });
   } catch (e) { console.error('[album] ' + e.message); res.status(502).json({ error: 'Album fetch failed: ' + e.message }); }
 });
 
-// ─── Artist ────────────────────────────────────────────────────────────────────
+// ─── Artist ───────────────────────────────────────────────────────────────────
 app.get('/u/:token/artist/:id', tokenMiddleware, async function(req, res) {
   var aid = parseInt(req.params.id, 10);
   if (isNaN(aid)) return res.status(400).json({ error: 'Invalid artist ID' });
   try {
-    var infoRaw = await hifiGet('/v1/artists/' + aid, { countryCode: COUNTRY });
-    var topRaw  = await hifiGet('/v1/artists/' + aid + '/toptracks', { countryCode: COUNTRY, limit: 20 });
-    var alRaw   = await hifiGet('/v1/artists/' + aid + '/albums',    { countryCode: COUNTRY, limit: 50 });
-    var artist   = (infoRaw.data) ? infoRaw.data : infoRaw;
-    var topItems = (topRaw.data && topRaw.data.items) ? topRaw.data.items : (topRaw.items || []);
-    var albItems = (alRaw.data  && alRaw.data.items)  ? alRaw.data.items  : (alRaw.items  || []);
-    var artistName = artist.name || 'Unknown';
-    var topTracks = topItems
-      .filter(function(t){ return t && t.id && t.streamReady !== false; })
-      .map(function(t){ return { id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t) || artistName, duration: t.duration ? Math.floor(t.duration) : undefined, artworkURL: coverUrl(t.album && t.album.cover) }; });
-    var albums = albItems
-      .filter(function(a){ return a && a.id; })
-      .map(function(a){ return { id: String(a.id), title: a.title || 'Unknown', artist: artistName, artworkURL: coverUrl(a.cover), trackCount: a.numberOfTracks || undefined, year: (a.releaseDate || '').slice(0, 4) || undefined }; });
+    var infoData = await hifiGet('/artist/', { id: aid });
+    var artistInfo = {};
+    if      (infoData.artist && infoData.artist.id)                            artistInfo = infoData.artist;
+    else if (infoData.data && infoData.data.artist && infoData.data.artist.id) artistInfo = infoData.data.artist;
+    else if (infoData.id && infoData.name)                                     artistInfo = infoData;
+    else if (infoData.data && infoData.data.id && infoData.data.name)          artistInfo = infoData.data;
+
+    var coverData = infoData.cover || {}, albumItems = [], allTracks = [];
+
+    // Primary: disc call — confirmed working
+    try {
+      var discData = await hifiGet('/artist/', { f: aid, skip_tracks: false });
+      if      (discData.albums && Array.isArray(discData.albums))  albumItems = discData.albums;
+      else if (discData.albums && discData.albums.items)            albumItems = discData.albums.items;
+      if      (discData.tracks && Array.isArray(discData.tracks))  allTracks  = discData.tracks;
+      else if (discData.tracks && discData.tracks.items)            allTracks  = discData.tracks.items;
+    } catch (e2) { console.log('[artist] disc call failed:', e2.message); }
+
+    // Fallback: /artist/albums/
+    if (!albumItems.length) {
+      try {
+        var albData = await hifiGet('/artist/albums/', { id: aid, limit: 50, offset: 0 });
+        albumItems = Array.isArray(albData) ? albData : albData.items ? albData.items : (albData.data && Array.isArray(albData.data)) ? albData.data : (albData.data && albData.data.items) ? albData.data.items : [];
+      } catch (e3) { console.log('[artist] /artist/albums/ failed:', e3.message); }
+    }
+
+    // Fallback: search
+    if (!albumItems.length && artistInfo.name) {
+      try {
+        var sData = await hifiGet('/search/', { s: artistInfo.name, limit: 20, offset: 0 });
+        var sItems = (sData && sData.data && sData.data.items) ? sData.data.items : [];
+        var aMap = {};
+        sItems.forEach(function(t) {
+          if (!t || !t.album || !t.album.id) return;
+          var tArt = trackArtist(t).toLowerCase(), want = (artistInfo.name || '').toLowerCase();
+          if (tArt.indexOf(want) === -1 && want.indexOf(tArt) === -1) return;
+          var alId = String(t.album.id);
+          if (!aMap[alId]) aMap[alId] = { id: alId, title: t.album.title, cover: t.album.cover, releaseDate: t.album.releaseDate, numberOfTracks: t.album.numberOfTracks };
+        });
+        albumItems = Object.values(aMap);
+      } catch (e5) { console.log('[artist] search fallback failed:', e5.message); }
+    }
+
+    var artistName = artistInfo.name || 'Unknown';
+    var artworkURL = coverData['750'] || coverUrl(artistInfo.picture, 480);
+    var topTracks = [];
+    allTracks.filter(function(t) { return t && t.id && t.streamReady !== false && t.allowStreaming !== false; })
+      .sort(function(a, b) { return (b.popularity || 0) - (a.popularity || 0); }).slice(0, 20)
+      .forEach(function(t) { topTracks.push({ id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t) || artistName, duration: trackDuration(t), artworkURL: coverUrl(t.album && t.album.cover) }); });
+
+    var albums = [];
+    albumItems.filter(function(a) { return a && a.id; })
+      .sort(function(a, b) { return (b.releaseDate || '').localeCompare(a.releaseDate || ''); }).slice(0, 60)
+      .forEach(function(al) { albums.push({ id: String(al.id), title: al.title || 'Unknown', artist: artistName, artworkURL: coverUrl(al.cover), trackCount: al.numberOfTracks || undefined, year: (al.releaseDate || '').slice(0, 4) || undefined }); });
+
     console.log('[artist] returning topTracks:', topTracks.length, 'albums:', albums.length);
-    res.json({ id: String(artist.id || aid), name: artistName, artworkURL: coverUrl(artist.picture, 480), topTracks: topTracks, albums: albums });
+    res.json({ id: String(artistInfo.id || aid), name: artistName, artworkURL: artworkURL, bio: null, topTracks: topTracks, albums: albums });
   } catch (e) { console.error('[artist] ' + e.message); res.status(502).json({ error: 'Artist fetch failed: ' + e.message }); }
 });
 
-// ─── Playlist ──────────────────────────────────────────────────────────────────
+// ─── Playlist ─────────────────────────────────────────────────────────────────
 app.get('/u/:token/playlist/:id', tokenMiddleware, async function(req, res) {
   var pid = req.params.id;
   if (!isPlaylistUUID(pid)) {
     console.warn('[playlist] rejected non-UUID id:', pid);
-    return res.status(404).json({ error: 'Invalid playlist ID — must be a TIDAL UUID.' });
+    return res.status(404).json({ error: 'Invalid playlist ID. TIDAL playlist IDs must be UUIDs (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).' });
   }
   try {
-    var infoRaw   = await hifiGet('/v1/playlists/' + pid, { countryCode: COUNTRY });
-    var tracksRaw = await hifiGet('/v1/playlists/' + pid + '/tracks', { countryCode: COUNTRY, limit: 100 });
-    var pl       = (infoRaw.data)   ? infoRaw.data   : infoRaw;
-    var rawItems = (tracksRaw.data && tracksRaw.data.items) ? tracksRaw.data.items : (tracksRaw.items || []);
-    console.log('[playlist] title:', pl.title, '| tracks:', rawItems.length);
-    var tracks = rawItems
-      .filter(function(t){ var item = t.item || t; return item && item.id && item.streamReady !== false; })
-      .map(function(t){ var item = t.item || t; return { id: String(item.id), title: item.title || 'Unknown', artist: trackArtist(item), duration: item.duration ? Math.floor(item.duration) : undefined, artworkURL: coverUrl(item.album && item.album.cover) }; });
-    res.json({ id: String(pl.uuid || pl.id || pid), title: pl.title || 'Playlist', description: pl.description || undefined, creator: (pl.creator && pl.creator.name) || undefined, artworkURL: coverUrl(pl.squareImage || pl.image, 480), trackCount: pl.numberOfTracks || tracks.length, tracks: tracks });
+    var data = await hifiGet('/playlist/', { id: pid, limit: 100, offset: 0 });
+    console.log('[playlist] top-level keys:', Object.keys(data));
+
+    var pl = null, rawItems = [];
+    if      (data.playlist && (data.playlist.uuid || data.playlist.id)) { pl = data.playlist; rawItems = data.items || data.playlist.items || []; }
+    else if (data.data && data.data.playlist)                            { pl = data.data.playlist; rawItems = data.data.items || data.items || []; }
+    else if (data.uuid || (data.title && data.numberOfTracks !== undefined)) { pl = data; rawItems = data.items || []; }
+    else if (data.data && (data.data.uuid || data.data.title))           { pl = data.data; rawItems = data.data.items || data.items || []; }
+    else                                                                 { pl = data; rawItems = data.items || []; }
+
+    console.log('[playlist] title:', pl && pl.title, '| items:', rawItems.length);
+    var tracks = [];
+    for (var i = 0; i < rawItems.length; i++) {
+      var t = rawItems[i].item || rawItems[i];
+      if (!t || !t.id || t.streamReady === false) continue;
+      tracks.push({ id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t), duration: trackDuration(t), artworkURL: coverUrl(t.album && t.album.cover) });
+    }
+
+    res.json({ id: String((pl && (pl.uuid || pl.id)) || pid), title: (pl && pl.title) || 'Playlist', creator: (pl && pl.creator && pl.creator.name) || undefined, artworkURL: (pl && (pl.squareImage || pl.image)) ? coverUrl(pl.squareImage || pl.image, 480) : undefined, trackCount: (pl && pl.numberOfTracks) || tracks.length, tracks: tracks });
   } catch (e) { console.error('[playlist] ' + e.message); res.status(502).json({ error: 'Playlist fetch failed: ' + e.message }); }
 });
 
-// ─── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, function(){ console.log('Claudochrome v2.1.1 (Hi-Fi API v2.7) on port ' + PORT); });
+// ─── Start ────────────────────────────────────────────────────────────────────
+app.listen(PORT, function() { console.log('Claudochrome v2.0.0 (Hi-Fi API v2.7) on port ' + PORT); });
