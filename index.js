@@ -69,12 +69,12 @@ async function hifiGet(path, params) {
   throw new Error('All Hi-Fi instances failed: ' + errors.slice(-2).join(' | '));
 }
 
+// Health check uses /search/?s= — lightweight ping all instances respond to
 async function checkInstances() {
   for (var inst of HIFI_INSTANCES) {
     try {
-      // Use the v1 search endpoint for health check — same one we use for search
-      await axios.get(inst + '/v1/search', {
-        params: { query: 'test', types: 'TRACKS', limit: 1, countryCode: COUNTRY },
+      await axios.get(inst + '/search/', {
+        params: { s: 'test', limit: 1 },
         headers: { 'User-Agent': UA }, timeout: 8000
       });
       activeInstance = inst; instanceHealthy = true; console.log('[hifi] healthy: ' + inst); return;
@@ -125,7 +125,7 @@ function checkRateLimit(entry) {
 }
 async function tokenMiddleware(req, res, next) {
   var entry = await getTokenEntry(req.params.token);
-  if (!entry)                return res.status(404).json({ error: 'Invalid token.' });
+  if (!entry)                 return res.status(404).json({ error: 'Invalid token.' });
   if (!checkRateLimit(entry)) return res.status(429).json({ error: 'Rate limit exceeded.' });
   req.tokenEntry = entry;
   if (entry.reqCount % 20 === 0) redisSave(req.params.token, entry);
@@ -192,7 +192,7 @@ function buildConfigPage(baseUrl) {
   h += '<p class="sub" style="margin-bottom:14px">Live status of all Hi-Fi API v2.7 instances.</p>';
   h += '<div class="inst-list" id="instList"><div style="color:#333;font-size:13px">Checking...</div></div>';
   h += '<button class="bg" style="margin-top:14px" onclick="checkHealth()">Refresh Status</button></div>';
-  h += '<footer>Claudochrome Eclipse Addon v2.1.0 &bull; Hi-Fi API v2.7</footer>';
+  h += '<footer>Claudochrome Eclipse Addon v2.1.1 &bull; Hi-Fi API v2.7</footer>';
   h += '<script>var _gu="",_ru="";';
   h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";';
   h += 'fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}';
@@ -235,7 +235,10 @@ app.get('/instances', async function(_req, res) {
   var results = await Promise.all(HIFI_INSTANCES.map(async function(inst) {
     var start = Date.now();
     try {
-      await axios.get(inst + '/v1/search', { params: { query: 'test', types: 'TRACKS', limit: 1, countryCode: COUNTRY }, headers: { 'User-Agent': UA }, timeout: 6000 });
+      await axios.get(inst + '/search/', {
+        params: { s: 'test', limit: 1 },
+        headers: { 'User-Agent': UA }, timeout: 6000
+      });
       return { url: inst, ok: true, ms: Date.now() - start };
     } catch (e) { return { url: inst, ok: false, ms: null }; }
   }));
@@ -243,7 +246,7 @@ app.get('/instances', async function(_req, res) {
 });
 
 app.get('/health', function(_req, res) {
-  res.json({ status: 'ok', version: '2.1.0', activeInstance: activeInstance, instanceHealthy: instanceHealthy, activeTokens: TOKEN_CACHE.size, redisConnected: !!(redis && redis.status === 'ready'), timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '2.1.1', activeInstance: activeInstance, instanceHealthy: instanceHealthy, activeTokens: TOKEN_CACHE.size, redisConnected: !!(redis && redis.status === 'ready'), timestamp: new Date().toISOString() });
 });
 
 // ─── Manifest ──────────────────────────────────────────────────────────────────
@@ -251,7 +254,7 @@ app.get('/u/:token/manifest.json', tokenMiddleware, function(req, res) {
   res.json({
     id:          'com.eclipse.claudochrome.' + req.params.token.slice(0, 8),
     name:        'Claudochrome (TIDAL)',
-    version:     '2.1.0',
+    version:     '2.1.1',
     description: 'Full TIDAL catalog via Hi-Fi API v2.7. Lossless FLAC, AAC 320. No account required.',
     icon:        'https://monochrome.tf/favicon.ico',
     resources:   ['search', 'stream', 'catalog'],
@@ -260,8 +263,8 @@ app.get('/u/:token/manifest.json', tokenMiddleware, function(req, res) {
 });
 
 // ─── Search ────────────────────────────────────────────────────────────────────
-// Uses /v1/search with query= and types=TRACKS,ALBUMS,ARTISTS,PLAYLISTS
-// This is the ONLY endpoint that returns real playlist objects from TIDAL
+// /v1/search returns four separate buckets: tracks, albums, artists, playlists
+// /search/ (old) ignores type filters and always returns tracks only
 app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
   var q = String(req.query.q || req.query.query || '').trim();
   console.log('[search] q:', JSON.stringify(q));
@@ -275,17 +278,17 @@ app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
       countryCode: COUNTRY
     });
 
-    // Log top-level keys so we can verify structure
-    console.log('[search] top-level keys:', Object.keys(r));
+    // Proxy may wrap in { version, data } or return flat — handle both shapes
+    var d = (r && r.data && (r.data.tracks || r.data.albums || r.data.artists || r.data.playlists)) ? r.data : r;
+    console.log('[search] response keys:', Object.keys(d));
 
-    var trackItems   = (r.tracks   && r.tracks.items)   || [];
-    var albumItems   = (r.albums   && r.albums.items)   || [];
-    var artistItems  = (r.artists  && r.artists.items)  || [];
-    var playlistItems = (r.playlists && r.playlists.items) || [];
+    var trackItems    = (d.tracks    && d.tracks.items)    || [];
+    var albumItems    = (d.albums    && d.albums.items)    || [];
+    var artistItems   = (d.artists   && d.artists.items)   || [];
+    var playlistItems = (d.playlists && d.playlists.items) || [];
 
-    console.log('[search] raw counts — tracks:', trackItems.length, 'albums:', albumItems.length, 'artists:', artistItems.length, 'playlists:', playlistItems.length);
+    console.log('[search] raw — tracks:', trackItems.length, 'albums:', albumItems.length, 'artists:', artistItems.length, 'playlists:', playlistItems.length);
 
-    // ── Tracks ──
     var tracks = trackItems
       .filter(function(t){ return t && t.id && t.streamReady !== false && t.allowStreaming !== false; })
       .map(function(t){
@@ -301,10 +304,8 @@ app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
         };
       });
 
-    // ── Albums ──
     var albums = albumItems
-      .filter(function(a){ return a && a.id; })
-      .slice(0, 8)
+      .filter(function(a){ return a && a.id; }).slice(0, 8)
       .map(function(a){
         return {
           id:         String(a.id),
@@ -316,28 +317,20 @@ app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
         };
       });
 
-    // ── Artists ──
     var artists = artistItems
-      .filter(function(a){ return a && a.id && a.name; })
-      .slice(0, 5)
+      .filter(function(a){ return a && a.id && a.name; }).slice(0, 5)
       .map(function(a){
-        return {
-          id:         String(a.id),
-          name:       a.name,
-          artworkURL: coverUrl(a.picture, 320)
-        };
+        return { id: String(a.id), name: a.name, artworkURL: coverUrl(a.picture, 320) };
       });
 
-    // ── Playlists ──
-    // Real TIDAL playlists have: uuid, title, creator, squareImage, numberOfTracks
-    // They do NOT have: trackNumber, replayGain, peak, isrc, audioQuality
+    // Real TIDAL playlists have uuid + numberOfTracks but never trackNumber/replayGain/isrc/audioQuality
     var playlists = playlistItems
       .filter(function(p){
-        if (!p || !p.title)                   return false;
-        if (p.trackNumber    !== undefined)   return false;
-        if (p.replayGain     !== undefined)   return false;
-        if (p.audioQuality   !== undefined)   return false;
-        if (p.isrc           !== undefined)   return false;
+        if (!p || !p.title)                return false;
+        if (p.trackNumber  !== undefined)  return false;
+        if (p.replayGain   !== undefined)  return false;
+        if (p.audioQuality !== undefined)  return false;
+        if (p.isrc         !== undefined)  return false;
         return !!(p.uuid || p.numberOfTracks !== undefined);
       })
       .slice(0, 5)
@@ -394,10 +387,8 @@ app.get('/u/:token/stream/:id', tokenMiddleware, async function(req, res) {
 app.get('/u/:token/album/:id', tokenMiddleware, async function(req, res) {
   var aid = req.params.id;
   try {
-    var [infoData, tracksData] = await Promise.all([
-      hifiGet('/v1/albums/' + aid,          { countryCode: COUNTRY }),
-      hifiGet('/v1/albums/' + aid + '/tracks', { countryCode: COUNTRY, limit: 100 })
-    ]);
+    var infoData   = await hifiGet('/v1/albums/' + aid, { countryCode: COUNTRY });
+    var tracksData = await hifiGet('/v1/albums/' + aid + '/tracks', { countryCode: COUNTRY, limit: 100 });
     var album      = (infoData.data)   ? infoData.data   : infoData;
     var rawItems   = (tracksData.data && tracksData.data.items) ? tracksData.data.items : (tracksData.items || []);
     var artistName = (album.artist && album.artist.name) || (album.artists && album.artists[0] && album.artists[0].name) || 'Unknown';
@@ -415,16 +406,14 @@ app.get('/u/:token/artist/:id', tokenMiddleware, async function(req, res) {
   var aid = parseInt(req.params.id, 10);
   if (isNaN(aid)) return res.status(400).json({ error: 'Invalid artist ID' });
   try {
-    var [infoRaw, topRaw, alRaw] = await Promise.all([
-      hifiGet('/v1/artists/' + aid,                { countryCode: COUNTRY }),
-      hifiGet('/v1/artists/' + aid + '/toptracks', { countryCode: COUNTRY, limit: 20 }),
-      hifiGet('/v1/artists/' + aid + '/albums',    { countryCode: COUNTRY, limit: 50 })
-    ]);
-    var artist     = (infoRaw.data) ? infoRaw.data : infoRaw;
-    var topItems   = (topRaw.data && topRaw.data.items) ? topRaw.data.items : (topRaw.items || []);
-    var albItems   = (alRaw.data  && alRaw.data.items)  ? alRaw.data.items  : (alRaw.items  || []);
+    var infoRaw = await hifiGet('/v1/artists/' + aid, { countryCode: COUNTRY });
+    var topRaw  = await hifiGet('/v1/artists/' + aid + '/toptracks', { countryCode: COUNTRY, limit: 20 });
+    var alRaw   = await hifiGet('/v1/artists/' + aid + '/albums',    { countryCode: COUNTRY, limit: 50 });
+    var artist   = (infoRaw.data) ? infoRaw.data : infoRaw;
+    var topItems = (topRaw.data && topRaw.data.items) ? topRaw.data.items : (topRaw.items || []);
+    var albItems = (alRaw.data  && alRaw.data.items)  ? alRaw.data.items  : (alRaw.items  || []);
     var artistName = artist.name || 'Unknown';
-    var topTracks  = topItems
+    var topTracks = topItems
       .filter(function(t){ return t && t.id && t.streamReady !== false; })
       .map(function(t){ return { id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t) || artistName, duration: t.duration ? Math.floor(t.duration) : undefined, artworkURL: coverUrl(t.album && t.album.cover) }; });
     var albums = albItems
@@ -443,10 +432,8 @@ app.get('/u/:token/playlist/:id', tokenMiddleware, async function(req, res) {
     return res.status(404).json({ error: 'Invalid playlist ID — must be a TIDAL UUID.' });
   }
   try {
-    var [infoRaw, tracksRaw] = await Promise.all([
-      hifiGet('/v1/playlists/' + pid,          { countryCode: COUNTRY }),
-      hifiGet('/v1/playlists/' + pid + '/tracks', { countryCode: COUNTRY, limit: 100 })
-    ]);
+    var infoRaw   = await hifiGet('/v1/playlists/' + pid, { countryCode: COUNTRY });
+    var tracksRaw = await hifiGet('/v1/playlists/' + pid + '/tracks', { countryCode: COUNTRY, limit: 100 });
     var pl       = (infoRaw.data)   ? infoRaw.data   : infoRaw;
     var rawItems = (tracksRaw.data && tracksRaw.data.items) ? tracksRaw.data.items : (tracksRaw.items || []);
     console.log('[playlist] title:', pl.title, '| tracks:', rawItems.length);
@@ -458,4 +445,4 @@ app.get('/u/:token/playlist/:id', tokenMiddleware, async function(req, res) {
 });
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT, function(){ console.log('Claudochrome v2.1.0 (Hi-Fi API v2.7) on port ' + PORT); });
+app.listen(PORT, function(){ console.log('Claudochrome v2.1.1 (Hi-Fi API v2.7) on port ' + PORT); });
