@@ -259,10 +259,10 @@ app.get('/health', function(_req, res) {
 app.get('/u/:token/manifest.json', tokenMiddleware, function(req, res) {
   res.json({
     id:          'com.eclipse.claudochrome.' + req.params.token.slice(0, 8),
-    name:        'Claudochrome (TIDAL)',
+    name:        'Claudochrome',
     version:     '2.0.0',
     description: 'Full TIDAL catalog via Hi-Fi API v2.7. Lossless FLAC, AAC 320. No account required.',
-    icon:        'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQMgYXz7IlgejaOJFQ7e10fxtpKP2-ljO2QhTATBmWqDQ&s=10',
+    icon:        'https://upload.wikimedia.org/wikipedia/commons/4/41/Tidal_%28service%29_logo_only.svg',
     resources:   ['search', 'stream', 'catalog'],
     types:       ['track', 'album', 'artist', 'playlist']
   });
