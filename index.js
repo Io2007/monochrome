@@ -10,13 +10,19 @@ app.use(cors());
 app.use(express.json());
 
 const HIFI_INSTANCES = [
-  'https://tidal-api.binimum.org',
   'https://ohio-1.monochrome.tf',
   'https://frankfurt-1.monochrome.tf',
+  'https://vogel.qqdl.site',
+  'https://tidal-api.binimum.org',
   'https://eu-central.monochrome.tf',
   'https://us-west.monochrome.tf',
   'https://hifi.geeked.wtf',
-  'https://monochrome-api.samidy.com'
+  'https://monochrome-api.samidy.com',
+  'https://hifi-two.spotisaver.net',
+  'https://wolf.qqdl.site',
+  'https://katze.qqdl.site',
+  'https://hund.qqdl.site',
+  'https://api.monochrome.tf',
 ];
 let activeInstance  = HIFI_INSTANCES[0];
 let instanceHealthy = false;
