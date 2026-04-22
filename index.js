@@ -435,14 +435,15 @@ app.get('/u/:token/manifest.json', tokenMiddleware, function(req, res) {
 
 // ─── Search ───────────────────────────────────────────────────────────────────
 app.get('/u/:token/search', tokenMiddleware, async function(req, res) {
-  var q    = String(req.query.q || req.query.query || req.query.s || '').trim();
-  var inst = req.tokenEntry.instanceUrl;
-  console.log('[search] q:', JSON.stringify(q));
+  var q     = String(req.query.q || req.query.query || req.query.s || '').trim();
+  var limit = Math.min(parseInt(req.query.limit, 10) || 20, 50);
+  var inst  = req.tokenEntry.instanceUrl;
+  console.log('[search] q:', JSON.stringify(q), 'limit:', limit);
   if (!q) return res.json({ tracks: [], albums: [], artists: [], playlists: [] });
 
   try {
     var [mainResult, pl1, pl2, pl3, pl4, pl5, ar1, ar2, ar3] = await Promise.allSettled([
-      hifiGetForToken(inst, '/search/', { s: q, limit: 20, offset: 0 }),
+      hifiGetForToken(inst, '/search/', { s: q, limit: limit, offset: 0 }),
       hifiGetForTokenSafe(inst, '/search/', { s: q, type: 'PLAYLISTS',  limit: 10, offset: 0 }),
       hifiGetForTokenSafe(inst, '/search/', { s: q, types: 'PLAYLISTS', limit: 10, offset: 0 }),
       hifiGetForTokenSafe(inst, '/search/', { s: q, filter: 'PLAYLISTS', limit: 10, offset: 0 }),
