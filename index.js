@@ -409,7 +409,7 @@ app.post('/generate', async (c) => {
     catch (e) { return Response.json({ error: 'Could not reach your instance: ' + e.message }, { status: 400 }); }
   }
 
-  const VALID_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
+  const VALID_QUALITIES = ['HI_RES', 'LOSSLESS', 'HIGH', 'LOW'];
   const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality)) ? body.preferredQuality : null;
   const token = generateToken();
   const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality };
@@ -541,34 +541,61 @@ app.get('/u/:token/stream/:id', async (c) => {
     const tid = c.req.param('id');
     const inst = entry.instanceUrl;
     const pref = entry.preferredQuality;
-    const qualities = pref ? [pref, ...['LOSSLESS','HIGH','LOW'].filter(q => q !== pref)] : ['LOSSLESS','HIGH','LOW'];
+
+    // No preference = try all from best to worst
+    // Preference selected = try that first, then fallback down only
+    const ALL_QUALITIES = ['HI_RES', 'LOSSLESS', 'HIGH', 'LOW'];
+    const qualities = pref
+      ? [pref, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(pref))]
+      : ALL_QUALITIES;
 
     for (let qi = 0; qi < qualities.length; qi++) {
       const ql = qualities[qi];
       try {
         console.log(`[stream] trying track ${tid} quality=${ql} inst=${inst || activeInstance}`);
         const data = await hifiGetForToken(inst, '/track/', { id: tid, quality: ql });
-        console.log(`[stream] raw response keys:`, Object.keys(data || {}));
         const payload = (data && data.data) ? data.data : data;
-        console.log(`[stream] payload keys:`, Object.keys(payload || {}));
-        console.log(`[stream] manifest present:`, !!(payload && payload.manifest));
 
         if (payload && payload.manifest) {
           const decoded = decodeManifest(payload.manifest);
-          console.log(`[stream] decoded:`, decoded);
           if (decoded && decoded.url) {
-            const isFlac = decoded.codec && (decoded.codec.includes('flac') || decoded.codec.includes('audio/flac'));
-            return Response.json({ url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '128kbps', expiresAt: Math.floor(Date.now() / 1000) + 21600 });
+            const codec = (decoded.codec || '').toLowerCase();
+            const isFlac = codec.includes('flac') || codec.includes('audio/flac');
+            const isMqa  = codec.includes('mqa');
+            const format = (isFlac || isMqa) ? 'flac' : 'aac';
+            const qualityLabel =
+              ql === 'HI_RES'   ? 'hires'    :
+              ql === 'LOSSLESS' ? 'lossless' :
+              ql === 'HIGH'     ? '320kbps'  : '128kbps';
+            console.log(`[stream] ✓ track ${tid} quality=${ql} codec=${decoded.codec} format=${format}`);
+            return Response.json({
+              url: decoded.url,
+              format,
+              quality: qualityLabel,
+              codec: decoded.codec || null,
+              expiresAt: Math.floor(Date.now() / 1000) + 21600
+            });
           }
         }
+
         if (payload && payload.url) {
-          console.log(`[stream] direct url found:`, payload.url);
-          return Response.json({ url: payload.url, format: 'aac', quality: 'lossless', expiresAt: Math.floor(Date.now() / 1000) + 21600 });
+          const qualityLabel =
+            ql === 'HI_RES'   ? 'hires'    :
+            ql === 'LOSSLESS' ? 'lossless' :
+            ql === 'HIGH'     ? '320kbps'  : '128kbps';
+          return Response.json({
+            url: payload.url,
+            format: 'aac',
+            quality: qualityLabel,
+            expiresAt: Math.floor(Date.now() / 1000) + 21600
+          });
         }
-        console.warn(`[stream] no url or manifest in payload for quality=${ql}`);
+
+        console.warn(`[stream] no url or manifest for quality=${ql}, trying next...`);
       } catch (e) {
         console.error(`[stream] error quality=${ql}:`, e.message);
-        if (qi === qualities.length - 1) return Response.json({ error: 'Could not get stream URL for track ' + tid + ': ' + e.message }, { status: 502 });
+        if (qi === qualities.length - 1)
+          return Response.json({ error: 'Could not get stream URL for track ' + tid + ': ' + e.message }, { status: 502 });
       }
     }
     return Response.json({ error: 'No stream found for track ' + tid }, { status: 404 });
