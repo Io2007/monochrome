@@ -538,20 +538,34 @@ app.get('/u/:token/stream/:id', async (c) => {
     const inst = entry.instanceUrl;
     const pref = entry.preferredQuality;
     const qualities = pref ? [pref, ...['LOSSLESS','HIGH','LOW'].filter(q => q !== pref)] : ['LOSSLESS','HIGH','LOW'];
+
     for (let qi = 0; qi < qualities.length; qi++) {
       const ql = qualities[qi];
       try {
+        console.log(`[stream] trying track ${tid} quality=${ql} inst=${inst || activeInstance}`);
         const data = await hifiGetForToken(inst, '/track/', { id: tid, quality: ql });
+        console.log(`[stream] raw response keys:`, Object.keys(data || {}));
         const payload = (data && data.data) ? data.data : data;
+        console.log(`[stream] payload keys:`, Object.keys(payload || {}));
+        console.log(`[stream] manifest present:`, !!(payload && payload.manifest));
+
         if (payload && payload.manifest) {
           const decoded = decodeManifest(payload.manifest);
+          console.log(`[stream] decoded:`, decoded);
           if (decoded && decoded.url) {
             const isFlac = decoded.codec && (decoded.codec.includes('flac') || decoded.codec.includes('audio/flac'));
             return Response.json({ url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '128kbps', expiresAt: Math.floor(Date.now() / 1000) + 21600 });
           }
         }
-        if (payload && payload.url) return Response.json({ url: payload.url, format: 'aac', quality: 'lossless', expiresAt: Math.floor(Date.now() / 1000) + 21600 });
-      } catch (e) { if (qi === qualities.length - 1) return Response.json({ error: 'Could not get stream URL for track ' + tid }, { status: 502 }); }
+        if (payload && payload.url) {
+          console.log(`[stream] direct url found:`, payload.url);
+          return Response.json({ url: payload.url, format: 'aac', quality: 'lossless', expiresAt: Math.floor(Date.now() / 1000) + 21600 });
+        }
+        console.warn(`[stream] no url or manifest in payload for quality=${ql}`);
+      } catch (e) {
+        console.error(`[stream] error quality=${ql}:`, e.message);
+        if (qi === qualities.length - 1) return Response.json({ error: 'Could not get stream URL for track ' + tid + ': ' + e.message }, { status: 502 });
+      }
     }
     return Response.json({ error: 'No stream found for track ' + tid }, { status: 404 });
   });
