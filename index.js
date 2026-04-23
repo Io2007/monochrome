@@ -2,7 +2,8 @@ const express = require('express');
 const cors    = require('cors');
 const axios   = require('axios');
 const crypto  = require('crypto');
-const Redis   = require('ioredis');
+let Redis = null;
+try { Redis = require('ioredis'); } catch(e) {}
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -751,3 +752,4 @@ if (typeof addEventListener === 'undefined' && require.main === module) {
   app.listen(PORT, function() { console.log('Claudochrome v2.0.0 (Hi-Fi API v2.7) on port ' + PORT); });
 }
 module.exports = app;
+export default app;
