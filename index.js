@@ -747,7 +747,7 @@ app.get('/u/:token/playlist/:id', tokenMiddleware, async function(req, res) {
 })();
 
 // ─── Start ────────────────────────────────────────────────────────────────────
-if (require.main === module) {
+if (typeof addEventListener === 'undefined' && require.main === module) {
   app.listen(PORT, function() { console.log('Claudochrome v2.0.0 (Hi-Fi API v2.7) on port ' + PORT); });
 }
 module.exports = app;
