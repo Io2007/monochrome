@@ -698,4 +698,41 @@ app.get('/u/:token/playlist/:id', async (c) => {
   });
 });
 
+// ─── TEMP DEBUG ROUTE — remove after diagnosing quality issue ────────────────
+app.get('/u/:token/debug/stream/:id', async (c) => {
+  return withToken(c, async (entry) => {
+    const tid = c.req.param('id');
+    const inst = entry.instanceUrl;
+    const results = [];
+
+    for (const ql of ['HI_RES', 'LOSSLESS', 'HIGH', 'LOW']) {
+      try {
+        const data = await hifiGetForToken(inst, '/track/', { id: tid, quality: ql });
+        const payload = (data && data.data) ? data.data : data;
+        const payloadKeys = Object.keys(payload || {});
+        let manifestDecoded = null;
+        if (payload && payload.manifest) {
+          try {
+            manifestDecoded = JSON.parse(Buffer.from(payload.manifest, 'base64').toString('utf8'));
+          } catch(e) { manifestDecoded = { error: e.message }; }
+        }
+        results.push({
+          quality: ql,
+          status: 'ok',
+          payloadKeys,
+          hasManifest: !!payload?.manifest,
+          manifestDecoded,
+          directUrl: payload?.url || null,
+          audioQuality: payload?.audioQuality || null,
+        });
+      } catch (e) {
+        results.push({ quality: ql, status: 'error', error: e.message });
+      }
+    }
+
+    return Response.json({ trackId: tid, inst: inst || activeInstance, results });
+  });
+});
+
 export default app;
+
