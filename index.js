@@ -63,15 +63,24 @@ function trackArtist(t) {
 }
 function decodeManifest(manifest) {
   try {
-    const decoded = JSON.parse(Buffer.from(manifest, 'base64').toString('utf8'));
-    // handle both urls[] and url (string)
-    const url = (decoded.urls && decoded.urls[0])
-      || decoded.url
-      || null;
-    const codec = decoded.codecs
-      || decoded.codec
-      || decoded.mimeType
-      || '';
+    const raw = Buffer.from(manifest, 'base64').toString('utf8');
+
+    // HI_RES often returns an XML MPEG-DASH manifest — extract the first audio URL
+    if (raw.trimStart().startsWith('<')) {
+      const urlMatch = raw.match(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/i)
+                    || raw.match(/<SegmentList[^>]*>[\s\S]*?<SegmentURL\s+media="([^"]+)"/i);
+      if (urlMatch && urlMatch[1]) {
+        const codec = raw.match(/codecs="([^"]+)"/i)?.[1] || 'flac';
+        console.log('[decodeManifest] XML/DASH manifest detected, codec:', codec);
+        return { url: urlMatch[1], codec };
+      }
+      console.warn('[decodeManifest] XML manifest but no BaseURL found');
+      return null;
+    }
+
+    const decoded = JSON.parse(raw);
+    const url = (decoded.urls && decoded.urls[0]) || decoded.url || null;
+    const codec = decoded.codecs || decoded.codec || decoded.mimeType || '';
     console.log('[decodeManifest] raw decoded:', JSON.stringify(decoded).slice(0, 200));
     return { url, codec };
   } catch (e) {
