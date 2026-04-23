@@ -464,22 +464,23 @@ app.get('/u/:token/manifest.json', async (c) => {
       name: 'Claudochrome', version: '2.0.0',
       description: 'Full TIDAL catalog via Hi-Fi API v2.7. Lossless FLAC, AAC 320. No account required.',
       icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQe_DbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQ&s=10',
-      resources: ['search', 'stream', 'catalog'], types: ['track', 'album', 'app.get('/u/:token/search', async (c) => {
+      resources: ['search', 'stream', 'catalog'], types: ['track', 'album', 'artist', 'playlist']
+    });
+  });
+});
+
+app.get('/u/:token/search', async (c) => {
   return withToken(c, async (entry) => {
     const q = String(c.req.query('q') || c.req.query('query') || c.req.query('s') || '').trim();
     const limit = Math.min(parseInt(c.req.query('limit') || '20', 10) || 20, 50);
     const inst = entry.instanceUrl;
     if (!q) return Response.json({ tracks: [], albums: [], artists: [], playlists: [] });
 
-    // Check Redis search cache first
     const cacheKey = 'mc:search:' + (inst || 'pool') + ':' + q.toLowerCase() + ':' + limit;
     const cached = await upstashCmd('GET', cacheKey);
-    if (cached) {
-      try { return Response.json(JSON.parse(cached)); } catch(e) {}
-    }
+    if (cached) { try { return Response.json(JSON.parse(cached)); } catch(e) {} }
 
     try {
-      // Two calls: main search + one playlist attempt (keeps CPU well under limit)
       const [mainResult, plResult] = await Promise.allSettled([
         hifiGetForToken(inst, '/search/', { s: q, limit, offset: 0 }),
         hifiGetForTokenSafe(inst, '/search/', { s: q, type: 'PLAYLISTS', limit: 10, offset: 0 })
@@ -506,12 +507,10 @@ app.get('/u/:token/manifest.json', async (c) => {
         tracks.push({ id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t), album: (t.album && t.album.title) || undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album && t.album.cover), format: 'flac' });
       }
 
-      // Build artist list sorted by relevance + hit count
       const artistList = Object.keys(artistMap)
         .sort((a, b) => (artistRelevance(artistMap[b].name, q) * 100 + (artistHits[b] || 0)) - (artistRelevance(artistMap[a].name, q) * 100 + (artistHits[a] || 0)))
         .slice(0, 5).map(k => artistMap[k]);
 
-      // Extract playlists from the playlist search result
       let plItems = [];
       if (plResult.status === 'fulfilled' && plResult.value) {
         const raw = plResult.value;
@@ -529,7 +528,6 @@ app.get('/u/:token/manifest.json', async (c) => {
       }
 
       const result = { tracks, albums: Object.values(albumMap).slice(0, 8), artists: artistList, playlists: plItems };
-      // Cache result in Redis for 5 minutes
       upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 300);
       return Response.json(result);
     } catch (e) {
@@ -537,13 +535,6 @@ app.get('/u/:token/manifest.json', async (c) => {
     }
   });
 });
-
-
- }, { status: 502 });
-    }
-  });
-});
-
 
 app.get('/u/:token/stream/:id', async (c) => {
   return withToken(c, async (entry) => {
