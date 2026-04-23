@@ -300,7 +300,7 @@ function buildConfigPage(baseUrl) {
   h += '.badge{display:none;background:#0d1a0d;border:1px solid #1a3a1a;border-radius:8px;padding:8px 12px;font-size:12px;color:#4a9a4a;margin-bottom:10px}';
 
   // ── Quality selector styles ────────────────────────────────────────────────
-  h += '.ql-row{display:flex;gap:8px;margin-bottom:6px}';
+  h += '.ql-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px}';
   h += '.ql-btn{flex:1;cursor:pointer;border:1px solid #2a2a2a;border-radius:10px;background:#0a0a0a;color:#555;font-size:12px;font-weight:700;padding:10px 6px;text-align:center;transition:all .15s;letter-spacing:.04em}';
   h += '.ql-btn:hover{border-color:#444;color:#aaa}';
   h += '.ql-btn.sel{background:#0d1520;border-color:#4a9eff;color:#4a9eff}';
@@ -321,7 +321,9 @@ function buildConfigPage(baseUrl) {
   // ── Quality selector ───────────────────────────────────────────────────────
   h += '<div class="lbl">Preferred Audio Quality <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
   h += '<div class="ql-row">';
-  h += '<div class="ql-btn" id="ql-LOSSLESS" onclick="selectQuality(\'LOSSLESS\')">LOSSLESS<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">FLAC / HiRes</span></div>';
+  h += '<div class="ql-btn" id="ql-HI_RES_LOSSLESS" onclick="selectQuality(\'HI_RES_LOSSLESS\')">HI-RES LOSSLESS<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">FLAC MQA 24-bit</span></div>';
+  h += '<div class="ql-btn" id="ql-HI_RES"   onclick="selectQuality(\'HI_RES\')">HI-RES<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">FLAC / HiRes</span></div>';
+  h += '<div class="ql-btn" id="ql-LOSSLESS" onclick="selectQuality(\'LOSSLESS\')">LOSSLESS<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">FLAC CD quality</span></div>';
   h += '<div class="ql-btn" id="ql-HIGH"     onclick="selectQuality(\'HIGH\')"    >HIGH<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">AAC 320 kbps</span></div>';
   h += '<div class="ql-btn" id="ql-LOW"      onclick="selectQuality(\'LOW\')"     >LOW<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">AAC 128 kbps</span></div>';
   h += '</div>';
@@ -353,10 +355,10 @@ function buildConfigPage(baseUrl) {
   h += 'var _gu="",_ru="",_selQ=null;';
 
   // quality toggle — clicking the same pill again deselects it
-  h += 'var QLABELS={LOSSLESS:"LOSSLESS (FLAC / HiRes)",HIGH:"HIGH (AAC 320 kbps)",LOW:"LOW (AAC 128 kbps)"};';
+  h += 'var QLABELS={HI_RES_LOSSLESS:"HI-RES LOSSLESS (FLAC MQA 24-bit)",HI_RES:"HI-RES (FLAC / HiRes)",LOSSLESS:"LOSSLESS (FLAC CD quality)",HIGH:"HIGH (AAC 320 kbps)",LOW:"LOW (AAC 128 kbps)"};';
   h += 'function selectQuality(q){';
   h += '  if(_selQ===q){_selQ=null;}else{_selQ=q;}';
-  h += '  ["LOSSLESS","HIGH","LOW"].forEach(function(k){';
+  h += '  ["HI_RES_LOSSLESS","HI_RES","LOSSLESS","HIGH","LOW"].forEach(function(k){';
   h += '    document.getElementById("ql-"+k).classList.toggle("sel",_selQ===k);';
   h += '  });';
   h += '  document.getElementById("qlHint").textContent=_selQ';
@@ -430,7 +432,7 @@ app.post('/generate', async (c) => {
     catch (e) { return Response.json({ error: 'Could not reach your instance: ' + e.message }, { status: 400 }); }
   }
 
-  const VALID_QUALITIES = ['HI_RES', 'LOSSLESS', 'HIGH', 'LOW'];
+  const VALID_QUALITIES = ['HI_RES_LOSSLESS', 'HI_RES', 'LOSSLESS', 'HIGH', 'LOW'];
   const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality)) ? body.preferredQuality : null;
   const token = generateToken();
   const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality };
@@ -583,7 +585,8 @@ app.get('/u/:token/stream/:id', async (c) => {
             const codec = (decoded.codec || '').toLowerCase();
             const isFlac = codec.includes('flac') || codec.includes('audio/flac');
             const isMqa  = codec.includes('mqa');
-            const format = (isFlac || isMqa) ? 'flac' : 'aac';
+            const isRealLossless = isFlac || isMqa;
+            const format = isRealLossless ? 'flac' : 'aac';
             const qualityLabel =
               isRealLossless && ql === 'HI_RES_LOSSLESS' ? 'hires'    :
               isRealLossless && ql === 'HI_RES'          ? 'hires'    :
