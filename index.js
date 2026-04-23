@@ -565,7 +565,7 @@ app.get('/u/:token/stream/:id', async (c) => {
 
     // No preference = try all from best to worst
     // Preference selected = try that first, then fallback down only
-    const ALL_QUALITIES = ['HI_RES', 'LOSSLESS', 'HIGH', 'LOW'];
+    const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'HI_RES', 'LOSSLESS', 'HIGH', 'LOW'];
     const qualities = pref
       ? [pref, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(pref))]
       : ALL_QUALITIES;
@@ -585,9 +585,11 @@ app.get('/u/:token/stream/:id', async (c) => {
             const isMqa  = codec.includes('mqa');
             const format = (isFlac || isMqa) ? 'flac' : 'aac';
             const qualityLabel =
-              ql === 'HI_RES'   ? 'hires'    :
-              ql === 'LOSSLESS' ? 'lossless' :
-              ql === 'HIGH'     ? '320kbps'  : '128kbps';
+              const qualityLabel =
+              isRealLossless && ql === 'HI_RES_LOSSLESS' ? 'hires'    :
+              isRealLossless && ql === 'HI_RES'          ? 'hires'    :
+              isRealLossless && ql === 'LOSSLESS'        ? 'lossless' :
+              ql === 'HIGH'                              ? '320kbps'  : '128kbps';
             console.log(`[stream] ✓ track ${tid} quality=${ql} codec=${decoded.codec} format=${format}`);
             return Response.json({
               url: decoded.url,
