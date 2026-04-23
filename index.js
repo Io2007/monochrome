@@ -585,7 +585,6 @@ app.get('/u/:token/stream/:id', async (c) => {
             const isMqa  = codec.includes('mqa');
             const format = (isFlac || isMqa) ? 'flac' : 'aac';
             const qualityLabel =
-              const qualityLabel =
               isRealLossless && ql === 'HI_RES_LOSSLESS' ? 'hires'    :
               isRealLossless && ql === 'HI_RES'          ? 'hires'    :
               isRealLossless && ql === 'LOSSLESS'        ? 'lossless' :
