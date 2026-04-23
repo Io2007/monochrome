@@ -63,9 +63,21 @@ function trackArtist(t) {
 }
 function decodeManifest(manifest) {
   try {
-    var decoded = JSON.parse(Buffer.from(manifest, 'base64').toString('utf8'));
-    return { url: (decoded.urls && decoded.urls[0]) || null, codec: decoded.codecs || decoded.mimeType || '' };
-  } catch (e) { return null; }
+    const decoded = JSON.parse(Buffer.from(manifest, 'base64').toString('utf8'));
+    // handle both urls[] and url (string)
+    const url = (decoded.urls && decoded.urls[0])
+      || decoded.url
+      || null;
+    const codec = decoded.codecs
+      || decoded.codec
+      || decoded.mimeType
+      || '';
+    console.log('[decodeManifest] raw decoded:', JSON.stringify(decoded).slice(0, 200));
+    return { url, codec };
+  } catch (e) {
+    console.error('[decodeManifest] failed:', e.message);
+    return null;
+  }
 }
 function isPlaylistUUID(id) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(id || ''));
