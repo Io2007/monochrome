@@ -27,7 +27,6 @@ function makeRes() {
 }
 
 const HIFI_INSTANCES = [
-  'https://hifi-api-pj08.onrender.com',
   'https://ohio-1.monochrome.tf',
   'https://frankfurt-1.monochrome.tf',
   'https://vogel.qqdl.site',
@@ -41,6 +40,7 @@ const HIFI_INSTANCES = [
   'https://katze.qqdl.site',
   'https://hund.qqdl.site',
   'https://api.monochrome.tf',
+  'https://hifi-api-pj08.onrender.com',
 ];
 let activeInstance  = HIFI_INSTANCES[0];
 let instanceHealthy = false;
