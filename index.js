@@ -27,8 +27,9 @@ function makeRes() {
 }
 
 const HIFI_INSTANCES = [
-  'https://tidal-api.binimum.org',
   'https://hifi-api-pj08.onrender.com',
+  'https://tidal-api.binimum.org',
+  'https://triton.squid.wtf',
   'https://ohio-1.monochrome.tf',
   'https://frankfurt-1.monochrome.tf',
   'https://vogel.qqdl.site',
