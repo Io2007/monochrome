@@ -30,6 +30,7 @@ const HIFI_INSTANCES = [
   'https://hifi-api-pj08.onrender.com',
   'https://tidal-api.binimum.org',
   'https://triton.squid.wtf',
+  'https://hifi-api-ifpc.onrender.com',
   'https://ohio-1.monochrome.tf',
   'https://frankfurt-1.monochrome.tf',
   'https://vogel.qqdl.site',
