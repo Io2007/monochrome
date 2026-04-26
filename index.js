@@ -68,7 +68,7 @@ function decodeManifest(manifest) {
 try {
 const raw = Buffer.from(manifest, 'base64').toString('utf8');
 
-// LOSSLESS / HI_RES returns a MPEG-DASH XML manifest
+// LOSSLESS / HI_RES_LOSSLESS returns a MPEG-DASH XML manifest
 if (raw.trimStart().startsWith('<')) {
 // Extract BaseURL — may have surrounding whitespace or XML-encoded & chars
 const urlMatch = raw.match(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/i)
@@ -84,7 +84,7 @@ console.warn('decodeManifest: XML manifest but no BaseURL/SegmentURL found');
 return null;
 }
 
-// HIGH / LOW returns a base64-encoded JSON manifest
+// HIGH (320kbps) / LOW (96kbps) returns a base64-encoded JSON manifest
 const decoded = JSON.parse(raw);
 // urls array preferred; fall back to single url field
 const url = (decoded.urls && decoded.urls.length > 0) ? decoded.urls[0] : (decoded.url || null);
@@ -330,13 +330,12 @@ h += '<div class="hint">Leave blank to use the shared pool. Paste your own self-
 // ── Quality selector ───────────────────────────────────────────────────────
 h += '<div class="lbl">Preferred Audio Quality <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 h += '<div class="ql-row">';
-h += '<div class="ql-btn" id="ql-HI_RES_LOSSLESS" onclick="selectQuality(\'HI_RES_LOSSLESS\')">HI-RES LOSSLESS<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">FLAC MQA 24-bit</span></div>';
-h += '<div class="ql-btn" id="ql-HI_RES" onclick="selectQuality(\'HI_RES\')">HI-RES<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">FLAC / HiRes</span></div>';
-h += '<div class="ql-btn" id="ql-LOSSLESS" onclick="selectQuality(\'LOSSLESS\')">LOSSLESS<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">FLAC CD quality</span></div>';
-h += '<div class="ql-btn" id="ql-HIGH" onclick="selectQuality(\'HIGH\')"> HIGH<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">AAC 320 kbps</span></div>';
-h += '<div class="ql-btn" id="ql-LOW" onclick="selectQuality(\'LOW\')"> LOW<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">AAC 128 kbps</span></div>';
+h += '<div class="ql-btn" id="ql-HI_RES_LOSSLESS" onclick="selectQuality(\'HI_RES_LOSSLESS\')">Hi-Res Max<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">TIDAL MAX / MQA</span></div>';
+h += '<div class="ql-btn" id="ql-LOSSLESS" onclick="selectQuality(\'LOSSLESS\')">Lossless<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">FLAC 16-bit CD</span></div>';
+h += '<div class="ql-btn" id="ql-HIGH" onclick="selectQuality(\'HIGH\')">AAC 320<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">AAC 320 kbps</span></div>';
+h += '<div class="ql-btn" id="ql-LOW" onclick="selectQuality(\'LOW\')">AAC 96<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">AAC 96 kbps</span></div>';
 h += '</div>';
-h += '<div class="hint" id="qlHint">No preference &mdash; addon tries LOSSLESS &rarr; HIGH &rarr; LOW automatically.</div>';
+h += '<div class="hint" id="qlHint">No preference &mdash; addon auto-selects best available: Lossless &rarr; AAC 320 &rarr; AAC 96.</div>';
 
 h += '<button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
 h += '<div class="box" id="genBox"><div class="badge" id="genBadge">&#10003; Locked to your custom instance</div><div class="blbl">Your addon URL &mdash; paste into Eclipse</div><div class="burl" id="genUrl"></div><button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button></div>';
@@ -370,15 +369,15 @@ h += '<footer>Claudochrome Eclipse Addon v2.0.0 &bull; Hi-Fi API v2.7</footer>';
 h += '<script>';
 h += 'var gu,ru,selQ=null;';
 // quality toggle — clicking the same pill again deselects it
-h += 'var QLABELS={"HI_RES_LOSSLESS":"HI-RES LOSSLESS — FLAC MQA 24-bit","HI_RES":"HI-RES — FLAC HiRes","LOSSLESS":"LOSSLESS — FLAC CD quality","HIGH":"HIGH — AAC 320 kbps","LOW":"LOW — AAC 128 kbps"};';
+h += 'var QLABELS={"HI_RES_LOSSLESS":"Hi-Res Max (TIDAL MAX / MQA)","LOSSLESS":"Lossless (FLAC 16-bit CD)","HIGH":"AAC 320 kbps","LOW":"AAC 96 kbps"};';
 h += 'function selectQuality(q){';
 h += 'if(selQ===q)selQ=null;else selQ=q;';
-h += '["HI_RES_LOSSLESS","HI_RES","LOSSLESS","HIGH","LOW"].forEach(function(k){';
+h += '["HI_RES_LOSSLESS","LOSSLESS","HIGH","LOW"].forEach(function(k){';
 h += 'document.getElementById("ql-"+k).classList.toggle("sel",selQ===k);';
 h += '});';
 h += 'document.getElementById("qlHint").textContent=selQ';
 h += '?"Preferred: "+QLABELS[selQ]+" \u2014 fallback to lower qualities if unavailable."';
-h += ':"No preference \u2014 addon tries LOSSLESS \u2192 HIGH \u2192 LOW automatically.";';
+h += ':"No preference \u2014 addon auto-selects best available: Lossless \u2192 AAC 320 \u2192 AAC 96.";';
 h += '}';
 h += 'function generate(){';
 h += 'var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";';
@@ -449,7 +448,7 @@ return Response.json({ error: 'Could not reach your instance: ' + e.message }, {
 }
 }
 
-const VALID_QUALITIES = ['HI_RES_LOSSLESS', 'HI_RES', 'LOSSLESS', 'HIGH', 'LOW'];
+const VALID_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
 const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality))
 ? body.preferredQuality : null;
 
@@ -644,7 +643,7 @@ const tid = c.req.param('id');
 const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
 
-const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'HI_RES', 'LOSSLESS', 'HIGH', 'LOW'];
+const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
 // Auto (no preference): start at LOSSLESS — most Hi-Fi instances cap here;
 // explicit HI_RES/HI_RES_LOSSLESS still tried first when user selects them
 const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
@@ -666,9 +665,9 @@ if (decoded && decoded.url) {
 const codec = (decoded.codec || '').toLowerCase();
 const isFlac = decoded.isDash || codec.includes('flac') || codec.includes('audio/flac');
 // Quality label is driven by the requested quality tier, not codec detection
-const qualityLabel = (ql === 'HI_RES_LOSSLESS' || ql === 'HI_RES') ? 'hires'
+const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires'
 : ql === 'LOSSLESS' ? 'lossless'
-: ql === 'HIGH' ? '320kbps' : '128kbps';
+: ql === 'HIGH' ? '320kbps' : '96kbps';
 const format = isFlac ? 'flac' : 'aac';
 console.log('stream: track', tid, 'quality', ql, 'isDash', decoded.isDash, 'codec', decoded.codec, 'format', format);
 return Response.json({ url: decoded.url, format, quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
@@ -677,11 +676,11 @@ return Response.json({ url: decoded.url, format, quality: qualityLabel, codec: d
 if (payload && payload.url) {
 // Direct URL on payload — determine format from quality tier and URL extension
 const looksLikeFlac = (payload.url || '').match(/\.flac(\?|$)/i);
-const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'HI_RES' || ql === 'LOSSLESS';
+const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
 const format = (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac';
-const qualityLabel = (ql === 'HI_RES_LOSSLESS' || ql === 'HI_RES') ? 'hires'
+const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires'
 : ql === 'LOSSLESS' ? 'lossless'
-: ql === 'HIGH' ? '320kbps' : '128kbps';
+: ql === 'HIGH' ? '320kbps' : '96kbps';
 console.log('stream: track', tid, 'direct URL quality', ql, 'format', format);
 return Response.json({ url: payload.url, format, quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
 }
@@ -798,7 +797,7 @@ return withToken(c, async entry => {
 const tid = c.req.param('id');
 const inst = entry.instanceUrl;
 const results = [];
-for (const ql of ['HI_RES', 'LOSSLESS', 'HIGH', 'LOW']) {
+for (const ql of ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW']) {
 try {
 const data = await hifiGetForToken(inst, '/track', { id: tid, quality: ql });
 const payload = data && data.data ? data.data : data;
