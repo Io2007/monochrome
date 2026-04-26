@@ -68,24 +68,29 @@ function decodeManifest(manifest) {
 try {
 const raw = Buffer.from(manifest, 'base64').toString('utf8');
 
-// HI_RES often returns an XML MPEG-DASH manifest — extract the first audio URL
+// LOSSLESS / HI_RES returns a MPEG-DASH XML manifest
 if (raw.trimStart().startsWith('<')) {
+// Extract BaseURL — may have surrounding whitespace or XML-encoded & chars
 const urlMatch = raw.match(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/i)
-|| raw.match(/<SegmentList[^>]*>[\s\S]*?<SegmentURL\s+media="([^"]+)"/i);
+|| raw.match(/<SegmentURL[^>]+media="([^"]+)"/i);
 if (urlMatch && urlMatch[1]) {
+const url = urlMatch[1].trim()
+.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
 const codec = raw.match(/codecs="([^"]+)"/i)?.[1] || 'flac';
-console.log('decodeManifest: XML/DASH manifest detected, codec:', codec);
-return { url: urlMatch[1], codec };
+console.log('decodeManifest: DASH manifest, codec:', codec, 'url prefix:', url.slice(0, 60));
+return { url, codec, isDash: true };
 }
-console.warn('decodeManifest: XML manifest but no BaseURL found');
+console.warn('decodeManifest: XML manifest but no BaseURL/SegmentURL found');
 return null;
 }
 
+// HIGH / LOW returns a base64-encoded JSON manifest
 const decoded = JSON.parse(raw);
-const url = decoded.urls ? decoded.urls[0] : decoded.url || null;
-const codec = decoded.codecs || decoded.codec || decoded.mimeType;
-console.log('decodeManifest: raw decoded', JSON.stringify(decoded).slice(0, 200));
-return { url, codec };
+// urls array preferred; fall back to single url field
+const url = (decoded.urls && decoded.urls.length > 0) ? decoded.urls[0] : (decoded.url || null);
+const codec = decoded.codecs || decoded.codec || decoded.mimeType || null;
+console.log('decodeManifest: JSON manifest, codec:', codec, 'url prefix:', (url || '').slice(0, 60));
+return { url, codec, isDash: false };
 } catch(e) {
 console.error('decodeManifest failed:', e.message);
 return null;
@@ -640,9 +645,12 @@ const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
 
 const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'HI_RES', 'LOSSLESS', 'HIGH', 'LOW'];
+// Auto (no preference): start at LOSSLESS — most Hi-Fi instances cap here;
+// explicit HI_RES/HI_RES_LOSSLESS still tried first when user selects them
+const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
 const qualities = pref
 ? [pref, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(pref))]
-: ALL_QUALITIES;
+: AUTO_QUALITIES;
 
 for (let qi = 0; qi < qualities.length; qi++) {
 const ql = qualities[qi];
@@ -653,22 +661,29 @@ const payload = data && data.data ? data.data : data;
 if (payload && payload.manifest) {
 const decoded = decodeManifest(payload.manifest);
 if (decoded && decoded.url) {
+// isDash = true means MPEG-DASH XML → always FLAC for TIDAL
+// For JSON manifests fall back to codec string detection
 const codec = (decoded.codec || '').toLowerCase();
-const isFlac = codec.includes('flac') || codec.includes('audio/flac');
-const isMqa = codec.includes('mqa');
-const isRealLossless = isFlac && !isMqa;
-const format = isRealLossless ? 'flac' : 'aac';
-const qualityLabel = isRealLossless && ql === 'HI_RES_LOSSLESS' ? 'hires'
-: isRealLossless && ql === 'HI_RES' ? 'hires'
-: isRealLossless && ql === 'LOSSLESS' ? 'lossless'
+const isFlac = decoded.isDash || codec.includes('flac') || codec.includes('audio/flac');
+// Quality label is driven by the requested quality tier, not codec detection
+const qualityLabel = (ql === 'HI_RES_LOSSLESS' || ql === 'HI_RES') ? 'hires'
+: ql === 'LOSSLESS' ? 'lossless'
 : ql === 'HIGH' ? '320kbps' : '128kbps';
-console.log('stream: track', tid, 'quality', ql, 'codec', decoded.codec, 'format', format);
+const format = isFlac ? 'flac' : 'aac';
+console.log('stream: track', tid, 'quality', ql, 'isDash', decoded.isDash, 'codec', decoded.codec, 'format', format);
 return Response.json({ url: decoded.url, format, quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
 }
 }
 if (payload && payload.url) {
-const qualityLabel = ql === 'HI_RES' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '128kbps';
-return Response.json({ url: payload.url, format: 'aac', quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
+// Direct URL on payload — determine format from quality tier and URL extension
+const looksLikeFlac = (payload.url || '').match(/\.flac(\?|$)/i);
+const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'HI_RES' || ql === 'LOSSLESS';
+const format = (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac';
+const qualityLabel = (ql === 'HI_RES_LOSSLESS' || ql === 'HI_RES') ? 'hires'
+: ql === 'LOSSLESS' ? 'lossless'
+: ql === 'HIGH' ? '320kbps' : '128kbps';
+console.log('stream: track', tid, 'direct URL quality', ql, 'format', format);
+return Response.json({ url: payload.url, format, quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
 }
 console.warn('stream: no url or manifest for quality', ql, ', trying next...');
 } catch(e) {
