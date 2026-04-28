@@ -656,22 +656,39 @@ return withToken(c, async entry => {
 const aid = c.req.param('id');
 const inst = entry.instanceUrl;
 try {
-const data = await hifiGetForToken(inst, '/album', { id: aid, limit: 100, offset: 0 });
-const album = data && data.data ? data.data : data;
-const rawItems = album.items || [];
-const artistName = album.artist?.name || album.artists?.map(a => a.name).join(', ') || 'Unknown';
-const tracks = rawItems.map((item, i) => {
-const t = item.item || item;
-if (!t || !t.id || t.streamReady === false) return null;
-const tTitle = t.title || 'Unknown';
-const tArtist = trackArtist(t) || artistName;
-cacheTrackMeta(t.id, tTitle, tArtist);
-redisCacheTrackMeta(String(t.id), tTitle, tArtist);
-return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(album.cover) };
-}).filter(Boolean);
-return Response.json({ id: String(album.id || aid), title: album.title || 'Unknown', artist: artistName, artworkURL: coverUrl(album.cover, 640), year: album.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album.numberOfTracks || tracks.length, tracks });
+  const data = await hifiGetForToken(inst, '/album', { id: aid, limit: 100, offset: 0 });
+  // Unwrap all known HiFi API response shapes
+  const album = data?.data?.id ? data.data
+    : data?.data?.album?.id ? data.data.album
+    : data?.album?.id ? data.album
+    : data?.id ? data
+    : data?.data ? data.data
+    : data;
+  // Collect track items — handle every nesting shape the API might return
+  let rawItems = album?.items
+    || album?.tracks?.items
+    || album?.tracks
+    || data?.items
+    || data?.tracks?.items
+    || [];
+  if (!Array.isArray(rawItems)) rawItems = [];
+  const artistName = album?.artist?.name
+    || album?.artists?.map(a => a.name).join(', ')
+    || 'Unknown';
+  const cover = album?.cover || album?.image || album?.artwork;
+  const tracks = rawItems.map((item, i) => {
+    const t = item?.item || item;
+    // Don't hard-filter on streamReady — TIDAL sometimes incorrectly marks playable tracks false
+    if (!t || !t.id) return null;
+    const tTitle = t.title || 'Unknown';
+    const tArtist = trackArtist(t) || artistName;
+    cacheTrackMeta(t.id, tTitle, tArtist);
+    redisCacheTrackMeta(String(t.id), tTitle, tArtist);
+    return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(cover) };
+  }).filter(Boolean);
+  return Response.json({ id: String(album?.id || aid), title: album?.title || 'Unknown', artist: artistName, artworkURL: coverUrl(cover, 640), year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album?.numberOfTracks || tracks.length, tracks });
 } catch(e) {
-return Response.json({ error: 'Album fetch failed: ' + e.message }, { status: 502 });
+  return Response.json({ error: 'Album fetch failed: ' + e.message }, { status: 502 });
 }
 });
 });
@@ -708,13 +725,29 @@ app.get('/u/:token/artist/:id', async c => {
       const albumSources = [];
       if (discResult.status === 'fulfilled' && discResult.value) {
         const d = discResult.value;
-        const a = Array.isArray(d.albums) ? d.albums : (d.albums?.items || []);
+        const a = Array.isArray(d.albums) ? d.albums : (d.albums?.items || d.albums || []);
         albumSources.push(...a);
       }
       if (albResult.status === 'fulfilled' && albResult.value) {
         const d = albResult.value;
-        const a = Array.isArray(d) ? d : (d.items || d.data?.items || d.data || []);
+        // Unwrap all known shapes: plain array, { items }, { data: { items } }, { data: [] }
+        const a = Array.isArray(d) ? d
+          : Array.isArray(d.items) ? d.items
+          : Array.isArray(d.data?.items) ? d.data.items
+          : Array.isArray(d.data) ? d.data
+          : [];
         albumSources.push(...a);
+        // If we got a full page of 100, try fetching a 2nd page (some artists have many albums)
+        if (a.length >= 100) {
+          try {
+            const d2 = await hifiGetForToken(inst, '/artist/albums', { id: aid, limit: 100, offset: 100 });
+            const a2 = Array.isArray(d2) ? d2
+              : Array.isArray(d2?.items) ? d2.items
+              : Array.isArray(d2?.data?.items) ? d2.data.items
+              : Array.isArray(d2?.data) ? d2.data : [];
+            albumSources.push(...a2);
+          } catch(_) {}
+        }
       }
 
       // ── Step 4: Collect track candidates from all sources ────────────────────
@@ -732,22 +765,41 @@ app.get('/u/:token/artist/:id', async c => {
         const t = Array.isArray(d) ? d : (d.items || d.data?.items || d.tracks?.items || d.tracks || d.data || []);
         trackSources.push(...t);
       }
-      // ALWAYS include search results as track source — these are 100% confirmed streamable
-      // and always have correct metadata + artwork
+      // Include search results for both tracks AND albums — search tracks are confirmed
+      // streamable and have correct metadata. Albums from search are filtered to only
+      // include albums where this artist is the PRIMARY/MAIN artist (not just featured).
       if (searchResult.status === 'fulfilled' && searchResult.value) {
         const d = searchResult.value;
         const sItems = d?.data?.items || d?.items || [];
         const want = artistName.toLowerCase();
+
+        // Helper: is this artist the main/primary artist on this track (not merely featured)?
+        // TIDAL sets artists[].type = 'MAIN' for primary and 'FEATURED' for featured artists.
+        const isMainArtist = t => {
+          const artists = t.artists || (t.artist ? [t.artist] : []);
+          if (!artists.length) return false;
+          const mains = artists.filter(a => !a.type || a.type === 'MAIN');
+          const checkList = mains.length ? mains : [artists[0]];
+          return checkList.some(a => {
+            const n = (a.name || '').toLowerCase();
+            return n === want || n.includes(want) || want.includes(n);
+          });
+        };
+
+        // Search tracks: include if this artist appears anywhere in the artist string
         const searchTracks = sItems.filter(t => {
           if (!t?.id || t.streamReady === false || t.allowStreaming === false) return false;
           const ar = trackArtist(t).toLowerCase();
           return ar.includes(want) || want.includes(ar);
         });
         trackSources.push(...searchTracks);
-        // Also collect albums from search results
+
+        // Search albums: ONLY include if this artist is the MAIN artist on the track
+        // This prevents "Future album with 1 Travis Scott feat" from showing up
         const searchAlbumMap = {};
         sItems.forEach(t => {
           if (!t?.album?.id) return;
+          if (!isMainArtist(t)) return; // skip albums where artist is only featured
           const alId = String(t.album.id);
           if (!searchAlbumMap[alId]) searchAlbumMap[alId] = {
             id: alId, title: t.album.title, cover: t.album.cover,
