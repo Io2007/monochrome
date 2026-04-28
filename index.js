@@ -31,7 +31,11 @@ const HIFI_INSTANCES = [
 let activeInstance = HIFI_INSTANCES[0];
 let instanceHealthy = false;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
-const QOBUZ_BASE = 'https://qobuz-api1.onrender.com';
+const QOBUZ_INSTANCES = [
+'https://qobuz-api1.onrender.com',
+'https://qobuz-api.stremio123.duckdns.org',
+];
+let activeQobuzInstance = QOBUZ_INSTANCES[0];
 
 // ─── In-memory track meta cache (title+artist by TIDAL id) ───────────────────
 // Populated at search time, read at stream time. Survives within the same worker instance.
@@ -114,18 +118,21 @@ return 0;
 
 // ─── Qobuz client ─────────────────────────────────────────────────────────────
 async function qobuzStream(trackId) {
+for (const inst of QOBUZ_INSTANCES) {
 for (const fmt of [27, 7, 6, 5]) {
 try {
-const r = await axios.get(QOBUZ_BASE + '/stream/' + trackId, {
+const r = await axios.get(inst + '/stream/' + trackId, {
 params: { format_id: fmt },
 headers: { 'User-Agent': UA },
 timeout: 12000
 });
 if (r.data && r.data.url) {
+if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
 const quality = fmt === 27 ? 'hires-192' : fmt === 7 ? 'hires-96' : fmt === 6 ? 'lossless' : '320kbps';
 return { url: r.data.url, format: fmt !== 5 ? 'flac' : 'mp3', quality, source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1800 };
 }
 } catch(e) { continue; }
+}
 }
 return null;
 }
@@ -133,16 +140,17 @@ return null;
 async function qobuzFindBestTrack(title, artist) {
 if (!title) return null;
 const q = (artist ? artist + ' ' : '') + title;
+for (const inst of QOBUZ_INSTANCES) {
 try {
-const r = await axios.get(QOBUZ_BASE + '/search', {
+const r = await axios.get(inst + '/search', {
 params: { q, limit: 10 },
 headers: { 'User-Agent': UA },
 timeout: 12000
 });
 const data = r.data || null;
-if (!data) return null;
+if (!data) continue;
 const items = (data.tracks && data.tracks.items) ? data.tracks.items : [];
-if (!items.length) return null;
+if (!items.length) continue;
 const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 const wantTitle = norm(title);
 const wantArtist = norm(artist || '');
@@ -160,14 +168,18 @@ return s;
 return score(b) - score(a);
 });
 const best = ranked[0];
-if (!best) return null;
+if (!best) continue;
 const bestTitle = norm(best.title || '');
 const bestArtist = norm((best.performer && best.performer.name) || (best.artist && best.artist.name) || '');
 const titleGood = wantTitle && (bestTitle === wantTitle || bestTitle.includes(wantTitle) || wantTitle.includes(bestTitle));
 const artistGood = !wantArtist || (bestArtist && (bestArtist === wantArtist || bestArtist.includes(wantArtist) || wantArtist.includes(bestArtist)));
-if (wantArtist ? (titleGood && artistGood) : titleGood) return best;
+if (wantArtist ? (titleGood && artistGood) : titleGood) {
+if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
+return best;
+}
+} catch(e) { continue; }
+}
 return null;
-} catch(e) { return null; }
 }
 
 // ─── Hi-Fi API client ─────────────────────────────────────────────────────────
@@ -481,7 +493,7 @@ return Response.json({ instances: results });
 });
 
 app.get('/health', c => {
-return Response.json({ status: 'ok', version: '2.3.0', activeInstance, instanceHealthy, qobuzBase: QOBUZ_BASE, cachedTracks: TRACK_META_CACHE.size, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
+return Response.json({ status: 'ok', version: '2.3.0', activeInstance, instanceHealthy, qobuzBase: activeQobuzInstance, cachedTracks: TRACK_META_CACHE.size, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
 });
 
 app.get('/u/:token/manifest.json', async c => {
