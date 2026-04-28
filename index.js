@@ -537,7 +537,7 @@ const t = items[i];
 if (!t || !t.id) continue;
 if (t.album && t.album.id) {
 const abid = String(t.album.id);
-if (!albumMap[abid]) albumMap[abid] = { id: abid, title: t.album.title || 'Unknown', artist: trackArtist(t), artworkURL: coverUrl(t.album.cover, 1280), trackCount: t.album.numberOfTracks, year: t.album.releaseDate ? String(t.album.releaseDate).slice(0, 4) : undefined };
+if (!albumMap[abid]) albumMap[abid] = { id: abid, title: t.album.title || 'Unknown', artist: trackArtist(t), artworkURL: coverUrl(t.album.cover, 1080), trackCount: t.album.numberOfTracks, year: t.album.releaseDate ? String(t.album.releaseDate).slice(0, 4) : undefined };
 }
 (t.artists || (t.artist ? [t.artist] : [])).forEach(a => {
 if (!a || !a.id) return;
@@ -550,7 +550,7 @@ const tTitle = t.title || 'Unknown';
 const tArtist = trackArtist(t);
 cacheTrackMeta(t.id, tTitle, tArtist);
 redisCacheTrackMeta(String(t.id), tTitle, tArtist);
-tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1280), format: 'flac' });
+tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: 'flac' });
 }
 
 const artistList = Object.keys(artistMap)
@@ -581,7 +581,7 @@ for (const p of [...(Array.isArray(plFromSearch) ? plFromSearch : []),
     id: pid,
     title: p.title || 'Playlist',
     creator: p.creator?.name || (p.type === 'EDITORIAL' ? 'TIDAL' : undefined),
-    artworkURL: coverUrl(p.squareImage || p.image || p.cover, 1280),
+    artworkURL: coverUrl(p.squareImage || p.image || p.cover, 1080),
     trackCount: p.numberOfTracks || p.trackCount,
   });
   if (plItems.length >= 10) break;
@@ -706,9 +706,9 @@ try {
     const tArtist = trackArtist(t) || artistName;
     cacheTrackMeta(t.id, tTitle, tArtist);
     redisCacheTrackMeta(String(t.id), tTitle, tArtist);
-    return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(cover, 1280) };
+    return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(cover, 1080) };
   }).filter(Boolean);
-  return Response.json({ id: String(album?.id || aid), title: album?.title || 'Unknown', artist: artistName, artworkURL: coverUrl(cover, 1280), year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album?.numberOfTracks || tracks.length, tracks });
+  return Response.json({ id: String(album?.id || aid), title: album?.title || 'Unknown', artist: artistName, artworkURL: coverUrl(cover, 1080), year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album?.numberOfTracks || tracks.length, tracks });
 } catch(e) {
   return Response.json({ error: 'Album fetch failed: ' + e.message }, { status: 502 });
 }
@@ -909,7 +909,7 @@ app.get('/u/:token/artist/:id', async c => {
           return {
             id: String(t.id), title: tTitle, artist: tArtist,
             duration: trackDuration(t),
-            artworkURL: coverUrl(t.album?.cover || t.album?.image || t.album?.artwork, 1280),
+            artworkURL: coverUrl(t.album?.cover || t.album?.image || t.album?.artwork, 1080),
           };
         });
 
@@ -923,7 +923,7 @@ app.get('/u/:token/artist/:id', async c => {
         })
         .map(al => ({
           id: String(al.id), title: al.title || 'Unknown', artist: artistName,
-          artworkURL: coverUrl(al.cover || al.image || al.artwork, 1280),
+          artworkURL: coverUrl(al.cover || al.image || al.artwork, 1080),
           trackCount: al.numberOfTracks,
           year: al.releaseDate ? String(al.releaseDate).slice(0, 4) : undefined,
         }));
@@ -959,9 +959,9 @@ const tTitle = t.title || 'Unknown';
 const tArtist = trackArtist(t);
 cacheTrackMeta(t.id, tTitle, tArtist);
 redisCacheTrackMeta(String(t.id), tTitle, tArtist);
-return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover, 1280) };
+return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover, 1080) };
 }).filter(Boolean);
-return Response.json({ id: String(pl?.uuid || pl?.id || pid), title: pl?.title || 'Playlist', creator: pl?.creator?.name, artworkURL: (pl?.squareImage || pl?.image) ? coverUrl(pl.squareImage || pl.image, 1280) : undefined, trackCount: pl?.numberOfTracks || tracks.length, tracks });
+return Response.json({ id: String(pl?.uuid || pl?.id || pid), title: pl?.title || 'Playlist', creator: pl?.creator?.name, artworkURL: (pl?.squareImage || pl?.image) ? coverUrl(pl.squareImage || pl.image, 1080) : undefined, trackCount: pl?.numberOfTracks || tracks.length, tracks });
 } catch(e) {
 return Response.json({ error: 'Playlist fetch failed: ' + e.message }, { status: 502 });
 }
