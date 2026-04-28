@@ -110,14 +110,13 @@ return 0;
 }
 
 // ─── Qobuz client ──────────────────────────────────────────────────────────────────
-// format_id priority: 27=192kHz HiRes, 7=96kHz HiRes, 6=16-bit FLAC, 5=MP3 320
 async function qobuzStream(trackId) {
 for (const fmt of [27, 7, 6, 5]) {
 try {
 const r = await axios.get(QOBUZ_BASE + '/stream/' + trackId, {
 params: { format_id: fmt },
 headers: { 'User-Agent': UA },
-timeout: 8000
+timeout: 12000
 });
 if (r.data && r.data.url) {
 const quality = fmt === 27 ? 'hires-192' : fmt === 7 ? 'hires-96' : fmt === 6 ? 'lossless' : '320kbps';
@@ -135,7 +134,7 @@ try {
 const r = await axios.get(QOBUZ_BASE + '/search', {
 params: { q, limit: 10 },
 headers: { 'User-Agent': UA },
-timeout: 8000
+timeout: 12000
 });
 const data = r.data || null;
 if (!data) return null;
@@ -662,42 +661,50 @@ const tid = c.req.param('id');
 const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
 
-// Eclipse passes title/artist as query params when available — use them directly.
-// If absent, do a fast TIDAL search by track ID to retrieve metadata.
+// Step 1: get title+artist from query params if Eclipse passed them
 let qTitle = String(c.req.query('title') || '').trim();
 let qArtist = String(c.req.query('artist') || '').trim();
 
+// Step 2: if no title, fetch track metadata from TIDAL /track endpoint (not /search)
 if (!qTitle) {
-// Fallback: search TIDAL for this track ID to get title+artist
 try {
-const searchData = await hifiGetForTokenSafe(inst, '/search', { s: tid, limit: 1, offset: 0 });
-const items = searchData?.data?.items || searchData?.items || [];
-const match = items.find(t => t && String(t.id) === String(tid));
-if (match && match.title) {
-qTitle = match.title;
-qArtist = trackArtist(match);
+// Try LOSSLESS first for metadata, then HIGH as fallback
+const metaData = await hifiGetForTokenSafe(inst, '/track', { id: tid, quality: 'LOSSLESS' })
+|| await hifiGetForTokenSafe(inst, '/track', { id: tid, quality: 'HIGH' });
+if (metaData) {
+// HiFi API wraps response in .data for track metadata
+const meta = metaData.data || metaData;
+// meta.track holds the track info on some instances
+const trackMeta = meta.track || meta;
+if (trackMeta && trackMeta.title) {
+qTitle = trackMeta.title;
+qArtist = trackArtist(trackMeta);
+console.log('qobuz: resolved metadata for', tid, '->', qTitle, 'by', qArtist);
 }
-} catch(e) {}
+}
+} catch(e) {
+console.warn('qobuz: metadata fetch failed for', tid, e.message);
+}
 }
 
-// ── 1) Qobuz Hi-Res ───────────────────────────────────────────────────────
+// Step 3: try Qobuz Hi-Res with resolved title+artist
 if (qTitle) {
 try {
 const qTrack = await qobuzFindBestTrack(qTitle, qArtist);
 if (qTrack && qTrack.id) {
 const qStream = await qobuzStream(qTrack.id);
 if (qStream) {
-console.log('qobuz: hit for', qTitle, 'by', qArtist, '-> id', qTrack.id);
+console.log('qobuz: HIT', qTitle, 'by', qArtist, '-> qobuz id', qTrack.id, qStream.quality);
 return Response.json(qStream);
 }
 }
 } catch(e) {
-console.warn('qobuz: error for', qTitle, e.message);
+console.warn('qobuz: stream error for', qTitle, e.message);
 }
 }
 
-// ── 2) TIDAL via HiFi pool ─────────────────────────────────────────────────
-console.log('qobuz: miss for tid', tid, '- falling back to TIDAL');
+// Step 4: TIDAL fallback
+console.log('qobuz: MISS for tid', tid, qTitle ? '(no qobuz match)' : '(no metadata)', '- falling back to TIDAL');
 const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
 const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
 const qualities = pref
