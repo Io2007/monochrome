@@ -67,32 +67,22 @@ return 'Unknown';
 function decodeManifest(manifest) {
 try {
 const raw = Buffer.from(manifest, 'base64').toString('utf8');
-
-// LOSSLESS / HI_RES_LOSSLESS returns a MPEG-DASH XML manifest
 if (raw.trimStart().startsWith('<')) {
-// Extract BaseURL — may have surrounding whitespace or XML-encoded & chars
 const urlMatch = raw.match(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/i)
 || raw.match(/<SegmentURL[^>]+media="([^"]+)"/i);
 if (urlMatch && urlMatch[1]) {
 const url = urlMatch[1].trim()
 .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
 const codec = raw.match(/codecs="([^"]+)"/i)?.[1] || 'flac';
-console.log('decodeManifest: DASH manifest, codec:', codec, 'url prefix:', url.slice(0, 60));
 return { url, codec, isDash: true };
 }
-console.warn('decodeManifest: XML manifest but no BaseURL/SegmentURL found');
 return null;
 }
-
-// HIGH (320kbps) / LOW (96kbps) returns a base64-encoded JSON manifest
 const decoded = JSON.parse(raw);
-// urls array preferred; fall back to single url field
 const url = (decoded.urls && decoded.urls.length > 0) ? decoded.urls[0] : (decoded.url || null);
 const codec = decoded.codecs || decoded.codec || decoded.mimeType || null;
-console.log('decodeManifest: JSON manifest, codec:', codec, 'url prefix:', (url || '').slice(0, 60));
 return { url, codec, isDash: false };
 } catch(e) {
-console.error('decodeManifest failed:', e.message);
 return null;
 }
 }
@@ -120,6 +110,67 @@ if (n.includes(q) || q.includes(n)) return 2;
 return 0;
 }
 
+// ─── Qobuz client ─────────────────────────────────────────────────────────────
+// Uses QOBUZ_API env var (defaults to https://qobuz-api1.onrender.com)
+// Stream format priority: 27 (192kHz Hi-Res) → 7 (96kHz Hi-Res) → 6 (16-bit FLAC) → 5 (MP3 320)
+
+const QOBUZ_BASE = typeof QOBUZ_API !== 'undefined' ? QOBUZ_API : 'https://qobuz-api1.onrender.com';
+
+async function qobuzSearch(q) {
+try {
+const r = await axios.get(QOBUZ_BASE + '/search', { params: { q, limit: 10 }, headers: { 'User-Agent': UA }, timeout: 8000 });
+return r.data || null;
+} catch(e) { return null; }
+}
+
+async function qobuzStream(trackId) {
+for (const fmt of [27, 7, 6, 5]) {
+try {
+const r = await axios.get(QOBUZ_BASE + '/stream/' + trackId, { params: { format_id: fmt }, headers: { 'User-Agent': UA }, timeout: 8000 });
+if (r.data && r.data.url) {
+const quality = fmt === 27 ? 'hires-192' : fmt === 7 ? 'hires-96' : fmt === 6 ? 'lossless' : '320kbps';
+const isFlac = fmt !== 5;
+return { url: r.data.url, format: isFlac ? 'flac' : 'mp3', quality, source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1800 };
+}
+} catch(e) { continue; }
+}
+return null;
+}
+
+async function qobuzFindBestTrack(title, artist) {
+if (!title) return null;
+const q = (artist ? artist + ' ' : '') + title;
+const data = await qobuzSearch(q);
+if (!data) return null;
+// Qobuz returns { tracks: { items: [...] } }
+const items = (data.tracks && data.tracks.items) ? data.tracks.items : [];
+if (!items.length) return null;
+const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+const wantTitle = norm(title);
+const wantArtist = norm(artist || '');
+const ranked = items.slice().sort((a, b) => {
+const score = item => {
+const t = norm(item.title);
+const ar = norm((item.performer && item.performer.name) || (item.artist && item.artist.name) || '');
+let s = 0;
+if (t === wantTitle) s += 5;
+if (wantArtist && ar === wantArtist) s += 5;
+if (wantTitle && t.includes(wantTitle)) s += 2;
+if (wantArtist && ar.includes(wantArtist)) s += 2;
+return s;
+};
+return score(b) - score(a);
+});
+const best = ranked[0];
+if (!best) return null;
+const bestTitle = norm(best.title);
+const bestArtist = norm((best.performer && best.performer.name) || (best.artist && best.artist.name) || '');
+const titleGood = wantTitle && (bestTitle === wantTitle || bestTitle.includes(wantTitle));
+const artistGood = !wantArtist || (bestArtist && (bestArtist === wantArtist || bestArtist.includes(wantArtist)));
+if (wantArtist ? (titleGood && artistGood) : bestTitle === wantTitle) return best;
+return null;
+}
+
 // ─── Hi-Fi API client — shared pool ──────────────────────────────────────────
 async function hifiGet(path, params) {
 var errors = [];
@@ -129,7 +180,6 @@ try {
 var r = await axios.get(inst + path, { params: params, headers: { 'User-Agent': UA, 'Accept': 'application/json' }, timeout: 15000 });
 if (r.status === 200 && r.data) {
 if (inst !== activeInstance) { activeInstance = inst; instanceHealthy = true; }
-console.log('hifi: switched to ' + inst);
 return r.data;
 }
 } catch(e) { errors.push(inst + ': ' + e.message); }
@@ -165,14 +215,11 @@ try {
 await axios.get(inst + '/search', { params: { s: 'test', limit: 1 }, timeout: 8000 });
 activeInstance = inst;
 instanceHealthy = true;
-console.log('hifi: healthy ' + inst);
 return;
 } catch(e) {}
 }
 instanceHealthy = false;
-console.warn('hifi: WARNING — no healthy instances.');
 }
-// setInterval removed — Workers are stateless
 
 // ─── Upstash Redis REST API ───────────────────────────────────────────────────
 const UPSTASH_URL = typeof UPSTASH_REDIS_REST_URL !== 'undefined' ? UPSTASH_REDIS_REST_URL : null;
@@ -188,7 +235,7 @@ body: JSON.stringify(args)
 });
 const json = await res.json();
 return json.result ?? null;
-} catch(e) { console.error('Upstash cmd failed:', e.message); return null; }
+} catch(e) { return null; }
 }
 
 async function redisSave(token, entry) {
@@ -198,7 +245,7 @@ lastUsed: entry.lastUsed,
 reqCount: entry.reqCount || 0,
 instanceUrl: entry.instanceUrl || null,
 preferredQuality: entry.preferredQuality || null
-}), 'EX', 2592000); // 30 days TTL
+}), 'EX', 2592000);
 }
 
 async function redisLoad(token) {
@@ -232,23 +279,17 @@ return b;
 
 async function getTokenEntry(token) {
 if (TOKEN_CACHE.has(token)) return TOKEN_CACHE.get(token);
-// Try Redis first
 var saved = await redisLoad(token);
 if (saved) {
 var entry = { createdAt: saved.createdAt, lastUsed: saved.lastUsed, reqCount: saved.reqCount, instanceUrl: saved.instanceUrl || null, preferredQuality: saved.preferredQuality || null, rateWin: [] };
 TOKEN_CACHE.set(token, entry);
 return entry;
 }
-
-// Workers are stateless — TOKEN_CACHE is lost between requests.
-// Without Redis, any well-formed token is trusted (no persistent store available).
-// Token format: 28 hex chars generated by crypto.randomBytes(14).toString('hex')
 if (/^[a-f0-9]{28}$/.test(token)) {
 var fresh = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl: null, preferredQuality: null };
 TOKEN_CACHE.set(token, fresh);
 return fresh;
 }
-
 return null;
 }
 
@@ -307,7 +348,6 @@ h += '.dot{width:7px;height:7px;border-radius:50%;background:#333;flex-shrink:0}
 h += '.inst-url{flex:1;color:#666;font-family:"SF Mono","Fira Code",monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}';
 h += '.inst-ms{color:#444;margin-left:auto;font-size:11px}';
 h += '.badge{display:none;background:#0d1a0d;border:1px solid #1a3a1a;border-radius:8px;padding:8px 12px;font-size:12px;color:#4a9a4a;margin-bottom:10px}';
-// Quality selector styles
 h += '.ql-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px}';
 h += '.ql-btn{flex:1;cursor:pointer;border:1px solid #2a2a2a;border-radius:10px;background:#0a0a0a;color:#555;font-size:12px;font-weight:700;padding:10px 6px;text-align:center;transition:all .15s;letter-spacing:.04em}';
 h += '.ql-btn:hover{border-color:#444;color:#aaa}';
@@ -319,15 +359,14 @@ h += '<svg width="52" height="52" viewBox="0 0 52 52" fill="none" style="margin-
 
 h += '<div class="card">';
 h += '<h1>Claudochrome for Eclipse</h1>';
-h += '<p class="sub">Full TIDAL catalog &mdash; lossless FLAC, HiRes, AAC 320 &mdash; no account, no subscription.</p>';
+h += '<p class="sub">Full TIDAL catalog &mdash; lossless FLAC, HiRes, AAC 320 &mdash; no account, no subscription. Streams: Qobuz Hi-Res &rarr; TIDAL &rarr; fallback.</p>';
 h += '<div class="tip"><b>Save your URL.</b> Paste it below to refresh without reinstalling.</div>';
-h += '<div class="pills"><span class="pill">Tracks &middot; Albums &middot; Artists</span><span class="pill hi">FLAC / HiRes</span><span class="pill hi">AAC 320</span></div>';
+h += '<div class="pills"><span class="pill">Tracks &middot; Albums &middot; Artists</span><span class="pill hi">FLAC / HiRes</span><span class="pill hi">AAC 320</span><span class="pill hi">Qobuz 24-bit</span></div>';
 
 h += '<div class="lbl">Custom Hi&#8209;Fi Instance <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 h += '<input type="text" id="customInstance" placeholder="https://your-instance.example.com">';
 h += '<div class="hint">Leave blank to use the shared pool. Paste your own self-hosted Hi-Fi API URL to lock this token exclusively to your instance.</div>';
 
-// ── Quality selector ───────────────────────────────────────────────────────
 h += '<div class="lbl">Preferred Audio Quality <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 h += '<div class="ql-row">';
 h += '<div class="ql-btn" id="ql-HI_RES_LOSSLESS" onclick="selectQuality(\'HI_RES_LOSSLESS\')">Hi-Res Max<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">TIDAL MAX / MQA</span></div>';
@@ -335,7 +374,7 @@ h += '<div class="ql-btn" id="ql-LOSSLESS" onclick="selectQuality(\'LOSSLESS\')"
 h += '<div class="ql-btn" id="ql-HIGH" onclick="selectQuality(\'HIGH\')">AAC 320<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">AAC 320 kbps</span></div>';
 h += '<div class="ql-btn" id="ql-LOW" onclick="selectQuality(\'LOW\')">AAC 96<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">AAC 96 kbps</span></div>';
 h += '</div>';
-h += '<div class="hint" id="qlHint">No preference &mdash; addon auto-selects best available: Lossless &rarr; AAC 320 &rarr; AAC 96.</div>';
+h += '<div class="hint" id="qlHint">No preference &mdash; addon auto-selects: Qobuz Hi-Res &rarr; TIDAL Lossless &rarr; AAC 320 &rarr; AAC 96.</div>';
 
 h += '<button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
 h += '<div class="box" id="genBox"><div class="badge" id="genBadge">&#10003; Locked to your custom instance</div><div class="blbl">Your addon URL &mdash; paste into Eclipse</div><div class="burl" id="genUrl"></div><button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button></div>';
@@ -352,9 +391,9 @@ h += '<div class="steps">';
 h += '<div class="step"><div class="sn">1</div><div class="st">Generate and copy your URL above</div></div>';
 h += '<div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Connections &rarr; Add Connection &rarr; Addon</div></div>';
 h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap Install</div></div>';
-h += '<div class="step"><div class="sn">4</div><div class="st">Search TIDAL\'s full catalog &mdash; FLAC quality auto-selected</div></div>';
+h += '<div class="step"><div class="sn">4</div><div class="st">Search TIDAL\'s full catalog &mdash; Qobuz Hi-Res tried first automatically</div></div>';
 h += '</div>';
-h += '<div class="warn">Hi-Fi instances are community-hosted. The addon auto-discovers working instances and fails over automatically. Tokens locked to a custom instance will only use that instance.</div>';
+h += '<div class="warn">Stream priority: <b>Qobuz Hi-Res 24-bit</b> (qobuz-api1.onrender.com) &rarr; TIDAL Lossless/HiRes (monochrome.tf pool) &rarr; lower quality fallback. Hi-Fi instances are community-hosted and auto-failover.</div>';
 h += '</div>';
 
 h += '<div class="card">';
@@ -364,11 +403,10 @@ h += '<div class="inst-list" id="instList"><div style="color:#333;font-size:13px
 h += '<button class="bg" style="margin-top:14px" onclick="checkHealth()">Refresh Status</button>';
 h += '</div>';
 
-h += '<footer>Claudochrome Eclipse Addon v2.0.0 &bull; Hi-Fi API v2.7</footer>';
+h += '<footer>Claudochrome Eclipse Addon v2.1.0 &bull; Hi-Fi API v2.7 + Qobuz Hi-Res</footer>';
 
 h += '<script>';
 h += 'var gu,ru,selQ=null;';
-// quality toggle — clicking the same pill again deselects it
 h += 'var QLABELS={"HI_RES_LOSSLESS":"Hi-Res Max (TIDAL MAX / MQA)","LOSSLESS":"Lossless (FLAC 16-bit CD)","HIGH":"AAC 320 kbps","LOW":"AAC 96 kbps"};';
 h += 'function selectQuality(q){';
 h += 'if(selQ===q)selQ=null;else selQ=q;';
@@ -377,7 +415,7 @@ h += 'document.getElementById("ql-"+k).classList.toggle("sel",selQ===k);';
 h += '});';
 h += 'document.getElementById("qlHint").textContent=selQ';
 h += '?"Preferred: "+QLABELS[selQ]+" \u2014 fallback to lower qualities if unavailable."';
-h += ':"No preference \u2014 addon auto-selects best available: Lossless \u2192 AAC 320 \u2192 AAC 96.";';
+h += ':"\u00a0No preference \u2014 auto-selects: Qobuz Hi-Res \u2192 TIDAL Lossless \u2192 AAC 320 \u2192 AAC 96.";';
 h += '}';
 h += 'function generate(){';
 h += 'var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";';
@@ -416,10 +454,35 @@ h += '.catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textC
 h += '}';
 h += 'function copyRef(){if(!ru)return;navigator.clipboard.writeText(ru).then(function(){var b=document.getElementById("copyRefBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);});}';
 h += 'function checkHealth(){var list=document.getElementById("instList");list.innerHTML=\'<div style="color:#333;font-size:13px">Checking...</div>\';';
-h += 'fetch("/instances").then(function(r){return r.json();}).then(function(data){list.innerHTML="";data.instances.forEach(function(inst){var row=document.createElement("div");row.className="inst";var dot=document.createElement("span");dot.className=inst.ok?"dot ok":"dot err";var urlSpan=document.createElement("span");urlSpan.className="inst-url";function maskUrl(u){var pre="https://";if(u.startsWith(pre)){var rest=u.slice(pre.length);return pre+rest.slice(0,6)+"•".repeat(Math.max(0,rest.length-6));}return u.slice(0,14)+"•".repeat(Math.max(0,u.length-14));}urlSpan.textContent=maskUrl(inst.url);row.appendChild(dot);row.appendChild(urlSpan);if(inst.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.textContent=inst.ms+"ms";row.appendChild(ms);}list.appendChild(row);});}).catch(function(){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Could not reach server</div>\';});}';
+h += 'fetch("/instances").then(function(r){return r.json();}).then(function(data){list.innerHTML="";data.instances.forEach(function(inst){var row=document.createElement("div");row.className="inst";var dot=document.createElement("span");dot.className=inst.ok?"dot ok":"dot err";var urlSpan=document.createElement("span");urlSpan.className="inst-url";function maskUrl(u){var pre="https://";if(u.startsWith(pre)){var rest=u.slice(pre.length);return pre+rest.slice(0,6)+"\u2022".repeat(Math.max(0,rest.length-6));}return u.slice(0,14)+"\u2022".repeat(Math.max(0,u.length-14));}urlSpan.textContent=maskUrl(inst.url);row.appendChild(dot);row.appendChild(urlSpan);if(inst.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.textContent=inst.ms+"ms";row.appendChild(ms);}list.appendChild(row);});}).catch(function(){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Could not reach server</div>\';});}';
 h += 'checkHealth();';
 h += '</script></body></html>';
 return h;
+}
+
+// ─── parseTokenParam ──────────────────────────────────────────────────────────
+function parseTokenParam(rawParam) {
+const tilde = rawParam.indexOf('~');
+if (tilde === -1) return { token: rawParam, embeddedInstance: null };
+const token = rawParam.slice(0, tilde);
+try {
+const embeddedInstance = Buffer.from(rawParam.slice(tilde + 1), 'base64url').toString('utf8');
+return { token, embeddedInstance };
+} catch(e) {
+return { token, embeddedInstance: null };
+}
+}
+
+// ─── withToken ────────────────────────────────────────────────────────────────
+async function withToken(c, handler) {
+const rawParam = c.req.param('token');
+const { token, embeddedInstance } = parseTokenParam(rawParam);
+const entry = await getTokenEntry(token);
+if (!entry) return Response.json({ error: 'Invalid token.' }, { status: 404 });
+if (!checkRateLimit(entry)) return Response.json({ error: 'Rate limit exceeded.' }, { status: 429 });
+if (embeddedInstance) entry.instanceUrl = embeddedInstance;
+if (entry.reqCount % 20 === 0) await redisSave(token, entry);
+return handler(entry);
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -459,10 +522,6 @@ await redisSave(token, entry);
 bucket.count++;
 
 const baseUrl = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
-
-// ★ FIX: Embed instanceUrl in the URL path segment so it is always available
-// regardless of Redis availability or stateless runtime restarts.
-// Format: TOKEN~BASE64URL (no custom instance = plain TOKEN, fully backward-compatible)
 const tokenSegment = instanceUrl
 ? token + '~' + Buffer.from(instanceUrl).toString('base64url')
 : token;
@@ -478,32 +537,22 @@ preferredQuality
 app.post('/refresh', async c => {
 const body = await parseBody(c);
 const raw = (body && body.existingUrl) ? String(body.existingUrl).trim() : '';
-
-// Extract the full token segment (may include ~BASE64 embedded instance)
 const segMatch = raw.match(/\/u\/([^/]+)\/manifest\.json/);
 const rawSegment = segMatch ? segMatch[1] : raw;
-
-// Strip embedded instance suffix so we look up the bare 28-hex token in Redis
 const { token: parsedToken } = parseTokenParam(rawSegment);
 const token = parsedToken;
-
 if (!token || !/^[a-f0-9]{28}$/.test(token)) {
 return Response.json({ error: 'Paste your full addon URL.' }, { status: 400 });
 }
-
 const entry = await getTokenEntry(token);
 if (!entry) {
 return Response.json({ error: 'URL not found. Generate a new one.' }, { status: 404 });
 }
-
 const baseUrl = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
-
-// Re-embed instanceUrl in the refreshed URL
 const instanceUrl = entry.instanceUrl;
 const tokenSegment = instanceUrl
 ? token + '~' + Buffer.from(instanceUrl).toString('base64url')
 : token;
-
 return Response.json({
 token,
 manifestUrl: baseUrl + '/u/' + tokenSegment + '/manifest.json',
@@ -523,38 +572,8 @@ return Response.json({ instances: results });
 });
 
 app.get('/health', c => {
-return Response.json({ status: 'ok', version: '2.0.0', activeInstance, instanceHealthy, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
+return Response.json({ status: 'ok', version: '2.1.0', activeInstance, instanceHealthy, qobuzBase: QOBUZ_BASE, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
 });
-
-// ─── parseTokenParam — strips embedded instance from token path segment ───────
-// Token param format: TOKEN (no custom instance) or TOKEN~BASE64URL (custom instance)
-// Using ~ as separator: safe in URL path segments and never appears in hex tokens.
-function parseTokenParam(rawParam) {
-const tilde = rawParam.indexOf('~');
-if (tilde === -1) return { token: rawParam, embeddedInstance: null };
-const token = rawParam.slice(0, tilde);
-try {
-const embeddedInstance = Buffer.from(rawParam.slice(tilde + 1), 'base64url').toString('utf8');
-return { token, embeddedInstance };
-} catch(e) {
-return { token, embeddedInstance: null };
-}
-}
-
-// ─── withToken — auth + rate-limit + instance resolution ──────────────────────
-async function withToken(c, handler) {
-const rawParam = c.req.param('token');
-const { token, embeddedInstance } = parseTokenParam(rawParam);
-const entry = await getTokenEntry(token);
-if (!entry) return Response.json({ error: 'Invalid token.' }, { status: 404 });
-if (!checkRateLimit(entry)) return Response.json({ error: 'Rate limit exceeded.' }, { status: 429 });
-// ★ FIX: URL-embedded instance takes priority over whatever Redis (or the stateless
-// fallback) returned. This guarantees the correct custom instance is always used
-// even when Redis is down or the in-memory TOKEN_CACHE was cleared.
-if (embeddedInstance) entry.instanceUrl = embeddedInstance;
-if (entry.reqCount % 20 === 0) await redisSave(token, entry);
-return handler(entry);
-}
 
 app.get('/u/:token/manifest.json', async c => {
 return withToken(c, entry => {
@@ -563,8 +582,8 @@ const { token } = parseTokenParam(rawParam);
 return Response.json({
 id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
 name: 'Claudochrome',
-version: '2.0.0',
-description: 'Full TIDAL catalog via Hi-Fi API v2.7. Lossless FLAC, AAC 320. No account required.',
+version: '2.1.0',
+description: 'Full TIDAL catalog via Hi-Fi API v2.7. Streams: Qobuz Hi-Res 24-bit → TIDAL Lossless → AAC 320. No account required.',
 icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQeDbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQs10',
 resources: ['search', 'stream', 'catalog'],
 types: ['track', 'album', 'artist', 'playlist']
@@ -637,15 +656,33 @@ return Response.json({ error: 'Search failed: ' + e.message, tracks: [], albums:
 });
 });
 
+// ─── Stream: Qobuz Hi-Res → HiFi/Tidal → fallback ────────────────────────────
 app.get('/u/:token/stream/:id', async c => {
 return withToken(c, async entry => {
 const tid = c.req.param('id');
 const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
 
+// ── 1) Qobuz Hi-Res (primary) ──────────────────────────────────────────────
+// Look up the track title/artist from TIDAL search first so Qobuz can match it
+let qobuzDone = false;
+try {
+// Fetch track metadata from HiFi to get title + artist for Qobuz matching
+const trackMeta = await hifiGetForTokenSafe(inst, '/track', { id: tid, quality: 'LOSSLESS' });
+const payload = trackMeta && trackMeta.data ? trackMeta.data : trackMeta;
+if (payload && payload.title) {
+const title = payload.title;
+const artist = trackArtist(payload);
+const qTrack = await qobuzFindBestTrack(title, artist);
+if (qTrack && qTrack.id) {
+const qStream = await qobuzStream(qTrack.id);
+if (qStream) return Response.json(qStream);
+}
+}
+} catch(e) {}
+
+// ── 2) HiFi / Tidal ────────────────────────────────────────────────────────
 const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
-// Auto (no preference): start at LOSSLESS — most Hi-Fi instances cap here;
-// explicit HI_RES/HI_RES_LOSSLESS still tried first when user selects them
 const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
 const qualities = pref
 ? [pref, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(pref))]
@@ -654,42 +691,30 @@ const qualities = pref
 for (let qi = 0; qi < qualities.length; qi++) {
 const ql = qualities[qi];
 try {
-console.log('stream: trying track', tid, 'quality', ql, 'inst', inst || activeInstance);
 const data = await hifiGetForToken(inst, '/track', { id: tid, quality: ql });
 const payload = data && data.data ? data.data : data;
 if (payload && payload.manifest) {
 const decoded = decodeManifest(payload.manifest);
 if (decoded && decoded.url) {
-// isDash = true means MPEG-DASH XML → always FLAC for TIDAL
-// For JSON manifests fall back to codec string detection
 const codec = (decoded.codec || '').toLowerCase();
 const isFlac = decoded.isDash || codec.includes('flac') || codec.includes('audio/flac');
-// Quality label is driven by the requested quality tier, not codec detection
-const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires'
-: ql === 'LOSSLESS' ? 'lossless'
-: ql === 'HIGH' ? '320kbps' : '96kbps';
+const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
 const format = isFlac ? 'flac' : 'aac';
-console.log('stream: track', tid, 'quality', ql, 'isDash', decoded.isDash, 'codec', decoded.codec, 'format', format);
 return Response.json({ url: decoded.url, format, quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
 }
 }
 if (payload && payload.url) {
-// Direct URL on payload — determine format from quality tier and URL extension
 const looksLikeFlac = (payload.url || '').match(/\.flac(\?|$)/i);
 const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
 const format = (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac';
-const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires'
-: ql === 'LOSSLESS' ? 'lossless'
-: ql === 'HIGH' ? '320kbps' : '96kbps';
-console.log('stream: track', tid, 'direct URL quality', ql, 'format', format);
+const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
 return Response.json({ url: payload.url, format, quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
 }
-console.warn('stream: no url or manifest for quality', ql, ', trying next...');
 } catch(e) {
-console.error('stream error for quality', ql, ':', e.message);
 if (qi === qualities.length - 1) return Response.json({ error: 'Could not get stream URL for track ' + tid + ': ' + e.message }, { status: 502 });
 }
 }
+
 return Response.json({ error: 'No stream found for track ' + tid }, { status: 404 });
 });
 });
@@ -791,7 +816,7 @@ return Response.json({ error: 'Playlist fetch failed: ' + e.message }, { status:
 });
 });
 
-// TEMP DEBUG ROUTE — remove after diagnosing quality issue
+// TEMP DEBUG ROUTE
 app.get('/u/:token/debug/stream/:id', async c => {
 return withToken(c, async entry => {
 const tid = c.req.param('id');
@@ -811,7 +836,21 @@ results.push({ quality: ql, status: 'ok', payloadKeys, hasManifest: !!payload?.m
 results.push({ quality: ql, status: 'error', error: e.message });
 }
 }
-return Response.json({ trackId: tid, inst: inst || activeInstance, results });
+// Also test Qobuz
+let qobuzResult = null;
+try {
+const trackMeta = await hifiGetForTokenSafe(inst, '/track', { id: tid, quality: 'LOSSLESS' });
+const payload = trackMeta && trackMeta.data ? trackMeta.data : trackMeta;
+if (payload && payload.title) {
+const qTrack = await qobuzFindBestTrack(payload.title, trackArtist(payload));
+qobuzResult = { matched: qTrack ? { id: qTrack.id, title: qTrack.title } : null };
+if (qTrack) {
+const qStream = await qobuzStream(qTrack.id);
+qobuzResult.stream = qStream;
+}
+}
+} catch(e) { qobuzResult = { error: e.message }; }
+return Response.json({ trackId: tid, inst: inst || activeInstance, qobuz: qobuzResult, results });
 });
 });
 
