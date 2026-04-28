@@ -699,137 +699,179 @@ app.get('/u/:token/artist/:id', async c => {
     const aid = parseInt(c.req.param('id'), 10);
     const inst = entry.instanceUrl;
     if (isNaN(aid)) return Response.json({ error: 'Invalid artist ID' }, { status: 400 });
+
+    // Pick the active base URL (custom instance or pool)
+    const base = inst || activeInstance;
+
     try {
-      // ── Step 1: Artist info ──────────────────────────────────────────────────
-      const infoData = await hifiGetForToken(inst, '/artist', { id: aid });
-      let artistInfo = infoData.artist?.id ? infoData.artist
-        : infoData.data?.artist?.id ? infoData.data.artist
-        : infoData.id ? infoData
-        : infoData.data?.id ? infoData.data : {};
-      const coverData = infoData.cover;
+      // ── Step 1: Fire ALL known endpoints in parallel ─────────────────────────
+      // Different HiFi instances expose different endpoint shapes/paths.
+      // We fire them all at once and merge — zero extra latency vs. sequential.
+      const [
+        infoRes,       // GET /artist/?id=   — basic artist info
+        discRes,       // GET /artist/?f=&skip_tracks=false  — full discography (albums+tracks)
+        disc2Res,      // GET /artist/discography/?id=  — alternate discography endpoint
+        topRes,        // GET /artist/toptracks/?id=
+        albRes,        // GET /artist/albums/?id=  — no filter (returns whatever default is)
+        albAlbumsRes,  // GET /artist/albums/?id=&filter=ALBUMS
+        albEpsRes,     // GET /artist/albums/?id=&filter=EPSSINGLES
+        albCompRes,    // GET /artist/albums/?id=&filter=COMPILATIONS
+        albAltRes,     // GET /artist/albums/?artistId=  — some instances use artistId param
+        searchRes,     // GET /search/?s=artistName  — fallback
+      ] = await Promise.allSettled([
+        axios.get(base + '/artist/',         { params: { id: aid },                                    headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
+        axios.get(base + '/artist/',         { params: { f: aid, skip_tracks: false },                 headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
+        axios.get(base + '/artist/discography/', { params: { id: aid, limit: 100 },                   headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
+        axios.get(base + '/artist/toptracks/', { params: { id: aid, limit: 30 },                      headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
+        axios.get(base + '/artist/albums/',  { params: { id: aid, limit: 100, offset: 0 },            headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
+        axios.get(base + '/artist/albums/',  { params: { id: aid, filter: 'ALBUMS',       limit: 100 }, headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
+        axios.get(base + '/artist/albums/',  { params: { id: aid, filter: 'EPSSINGLES',   limit: 100 }, headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
+        axios.get(base + '/artist/albums/',  { params: { id: aid, filter: 'COMPILATIONS', limit: 100 }, headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
+        axios.get(base + '/artist/albums/',  { params: { artistId: aid, limit: 100 },                 headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
+        // search result deferred — we need artistName first, filled below if needed
+        Promise.resolve(null),
+      ]);
+
+      // ── Step 2: Extract artist info ──────────────────────────────────────────
+      const extractData = r => {
+        if (!r || r.status !== 'fulfilled' || !r.value) return {};
+        return r.value.data?.data || r.value.data || {};
+      };
+
+      let artistInfo = {};
+      const infoD = extractData(infoRes);
+      if      (infoD.artist?.id)   artistInfo = infoD.artist;
+      else if (infoD.id && infoD.name) artistInfo = infoD;
+      // Fallback: disc response often has artist embedded
+      if (!artistInfo.name) {
+        const discD = extractData(discRes);
+        if      (discD.artist?.id)    artistInfo = discD.artist;
+        else if (discD.id && discD.name) artistInfo = discD;
+      }
+      if (!artistInfo.name) {
+        const disc2D = extractData(disc2Res);
+        if      (disc2D.artist?.id)     artistInfo = disc2D.artist;
+        else if (disc2D.id && disc2D.name) artistInfo = disc2D;
+      }
+
       const artistName = artistInfo.name || 'Unknown';
+      const coverData  = infoD.cover;
       const artworkURL = coverData
         ? (coverData[750] || coverData[480] || coverData[320])
         : coverUrl(artistInfo.picture, 480);
 
-      // ── Step 2: Fetch everything in parallel ─────────────────────────────────
-      // /artist/albums only returns one content type at a time — we must request each
-      // type separately: ALBUMS, EPSSINGLES, COMPILATIONS. All run in parallel.
-      const [
-        discResult, topResult, searchResult,
-        albAlbumsResult, albEpsResult, albCompResult,
-      ] = await Promise.allSettled([
-        hifiGetForToken(inst, '/artist/f', { aid, skiptracks: false }),
-        hifiGetForToken(inst, '/artist/toptracks', { id: aid, limit: 30, offset: 0 }),
-        hifiGetForToken(inst, '/search', { s: artistName, limit: 50, offset: 0 }),
-        hifiGetForToken(inst, '/artist/albums', { id: aid, filter: 'ALBUMS',        limit: 100, offset: 0 }),
-        hifiGetForToken(inst, '/artist/albums', { id: aid, filter: 'EPSSINGLES',    limit: 100, offset: 0 }),
-        hifiGetForToken(inst, '/artist/albums', { id: aid, filter: 'COMPILATIONS',  limit: 100, offset: 0 }),
-      ]);
-
-      // Helper: unwrap any HiFi /artist/albums response shape into a plain array
-      function unwrapAlbums(d) {
-        if (!d) return [];
-        if (Array.isArray(d)) return d;
-        if (Array.isArray(d.items)) return d.items;
-        if (Array.isArray(d.data?.items)) return d.data.items;
-        if (Array.isArray(d.data)) return d.data;
+      // ── Step 3: Merge albums from every source ────────────────────────────────
+      const albumMap = {};
+      const addAlbums = arr => {
+        for (const a of (Array.isArray(arr) ? arr : [])) {
+          if (!a?.id) continue;
+          albumMap[String(a.id)] = albumMap[String(a.id)] || a;
+        }
+      };
+      const extractAlbums = r => {
+        const d = extractData(r);
+        if (Array.isArray(d))               return d;
+        if (Array.isArray(d.albums))        return d.albums;
+        if (Array.isArray(d.albums?.items)) return d.albums.items;
+        if (Array.isArray(d.items))         return d.items;
         return [];
+      };
+      const extractTracks = r => {
+        const d = extractData(r);
+        if (Array.isArray(d.tracks))        return d.tracks;
+        if (Array.isArray(d.tracks?.items)) return d.tracks.items;
+        if (Array.isArray(d.items))         return d.items;
+        if (Array.isArray(d))               return d;
+        return [];
+      };
+
+      // Albums from discography endpoints
+      addAlbums(extractAlbums(discRes));
+      addAlbums(extractAlbums(disc2Res));
+      addAlbums(extractAlbums(infoRes));
+
+      // Albums from per-type album endpoints
+      for (const r of [albRes, albAlbumsRes, albEpsRes, albCompRes, albAltRes]) {
+        addAlbums(extractAlbums(r));
       }
 
-      // Helper: if a page came back full (100 items) fetch next page too
-      async function fetchPage2IfNeeded(result, filter) {
-        if (result.status !== 'fulfilled' || !result.value) return [];
-        const page1 = unwrapAlbums(result.value);
-        if (page1.length < 100) return page1;
-        try {
-          const d2 = await hifiGetForToken(inst, '/artist/albums', { id: aid, filter, limit: 100, offset: 100 });
-          return [...page1, ...unwrapAlbums(d2)];
-        } catch(_) { return page1; }
+      // If any per-type page came back full (100), fetch page 2
+      const albumTypeParams = [
+        { filter: undefined },
+        { filter: 'ALBUMS' },
+        { filter: 'EPSSINGLES' },
+        { filter: 'COMPILATIONS' },
+      ];
+      const page2Fetches = [];
+      const typeResults  = [albRes, albAlbumsRes, albEpsRes, albCompRes];
+      for (let i = 0; i < typeResults.length; i++) {
+        const r = typeResults[i];
+        if (r.status !== 'fulfilled') continue;
+        const page1 = extractAlbums(r);
+        if (page1.length >= 100) {
+          const p = { id: aid, limit: 100, offset: 100 };
+          if (albumTypeParams[i].filter) p.filter = albumTypeParams[i].filter;
+          page2Fetches.push(
+            axios.get(base + '/artist/albums/', { params: p, headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 })
+              .then(r2 => { addAlbums(extractAlbums({ status: 'fulfilled', value: r2 })); })
+              .catch(() => {})
+          );
+        }
       }
+      if (page2Fetches.length) await Promise.allSettled(page2Fetches);
 
-      // ── Step 3: Collect album items from all sources ─────────────────────────
-      const albumSources = [];
+      // ── Step 4: Search fallback if albums still empty ────────────────────────
+      const trackMap = {};
+      const addTracks = arr => {
+        for (const t of (Array.isArray(arr) ? arr : [])) {
+          if (!t?.id) continue;
+          trackMap[String(t.id)] = trackMap[String(t.id)] || t;
+        }
+      };
 
-      // From /artist/f discography (combined endpoint — best single source)
-      if (discResult.status === 'fulfilled' && discResult.value) {
-        const d = discResult.value;
-        const a = Array.isArray(d.albums) ? d.albums : (d.albums?.items || d.albums || []);
-        albumSources.push(...a);
-      }
+      // Tracks from discography
+      addTracks(extractTracks(discRes));
+      addTracks(extractTracks(disc2Res));
+      // Tracks from toptracks
+      addTracks(extractTracks(topRes));
 
-      // From dedicated per-type album fetches (Albums, EPs/Singles, Compilations)
-      const [albumsPage, epsPage, compPage] = await Promise.all([
-        fetchPage2IfNeeded(albAlbumsResult, 'ALBUMS'),
-        fetchPage2IfNeeded(albEpsResult,    'EPSSINGLES'),
-        fetchPage2IfNeeded(albCompResult,   'COMPILATIONS'),
-      ]);
-      albumSources.push(...albumsPage, ...epsPage, ...compPage);
-
-      // ── Step 4: Collect track candidates from all sources ────────────────────
-      const trackSources = [];
-
-      // From /artist/f discography
-      if (discResult.status === 'fulfilled' && discResult.value) {
-        const d = discResult.value;
-        const t = Array.isArray(d.tracks) ? d.tracks : (d.tracks?.items || []);
-        trackSources.push(...t);
-      }
-      // From /artist/toptracks
-      if (topResult.status === 'fulfilled' && topResult.value) {
-        const d = topResult.value;
-        const t = Array.isArray(d) ? d : (d.items || d.data?.items || d.tracks?.items || d.tracks || d.data || []);
-        trackSources.push(...t);
-      }
-      // Include search results for both tracks AND albums — search tracks are confirmed
-      // streamable and have correct metadata. Albums from search are filtered to only
-      // include albums where this artist is the PRIMARY/MAIN artist (not just featured).
-      if (searchResult.status === 'fulfilled' && searchResult.value) {
-        const d = searchResult.value;
-        const sItems = d?.data?.items || d?.items || [];
-        const want = artistName.toLowerCase();
-
-        // Helper: is this artist the main/primary artist on this track (not merely featured)?
-        // TIDAL sets artists[].type = 'MAIN' for primary and 'FEATURED' for featured artists.
-        const isMainArtist = t => {
-          const artists = t.artists || (t.artist ? [t.artist] : []);
-          if (!artists.length) return false;
-          const mains = artists.filter(a => !a.type || a.type === 'MAIN');
-          const checkList = mains.length ? mains : [artists[0]];
-          return checkList.some(a => {
+      // Search fallback — always run to supplement tracks; albums only if still empty
+      try {
+        const sr = await axios.get(base + '/search/', {
+          params: { s: artistName, limit: 50 },
+          headers: { 'User-Agent': UA, Accept: 'application/json' },
+          timeout: 12000,
+        });
+        const sItems = sr.data?.data?.items || sr.data?.items || [];
+        const want   = artistName.toLowerCase();
+        const isMain = t => {
+          const arts = t.artists || (t.artist ? [t.artist] : []);
+          if (!arts.length) return false;
+          const mains = arts.filter(a => !a.type || a.type === 'MAIN');
+          return (mains.length ? mains : [arts[0]]).some(a => {
             const n = (a.name || '').toLowerCase();
             return n === want || n.includes(want) || want.includes(n);
           });
         };
-
-        // Search tracks: include if this artist appears anywhere in the artist string
-        const searchTracks = sItems.filter(t => {
-          if (!t?.id || t.streamReady === false || t.allowStreaming === false) return false;
+        for (const t of sItems) {
+          if (!t?.id) continue;
           const ar = trackArtist(t).toLowerCase();
-          return ar.includes(want) || want.includes(ar);
-        });
-        trackSources.push(...searchTracks);
+          if (ar.includes(want) || want.includes(ar)) addTracks([t]);
+          if (t.album?.id && isMain(t)) {
+            const alId = String(t.album.id);
+            albumMap[alId] = albumMap[alId] || {
+              id: t.album.id, title: t.album.title, cover: t.album.cover,
+              releaseDate: t.album.releaseDate, numberOfTracks: t.album.numberOfTracks,
+            };
+          }
+        }
+      } catch(_) {}
 
-        // Search albums: ONLY include if this artist is the MAIN artist on the track
-        // This prevents "Future album with 1 Travis Scott feat" from showing up
-        const searchAlbumMap = {};
-        sItems.forEach(t => {
-          if (!t?.album?.id) return;
-          if (!isMainArtist(t)) return; // skip albums where artist is only featured
-          const alId = String(t.album.id);
-          if (!searchAlbumMap[alId]) searchAlbumMap[alId] = {
-            id: alId, title: t.album.title, cover: t.album.cover,
-            releaseDate: t.album.releaseDate, numberOfTracks: t.album.numberOfTracks,
-          };
-        });
-        albumSources.push(...Object.values(searchAlbumMap));
-      }
-
-      // ── Step 5: Build topTracks — deduplicate, sort by popularity ────────────
+      // ── Step 5: Build topTracks ───────────────────────────────────────────────
       const seenTrackIds = new Set();
-      const topTracks = trackSources
+      const topTracks = Object.values(trackMap)
         .filter(t => {
-          if (!t?.id || t.streamReady === false || t.allowStreaming === false) return false;
+          if (!t?.id || t.allowStreaming === false) return false;
           const k = String(t.id);
           if (seenTrackIds.has(k)) return false;
           seenTrackIds.add(k);
@@ -843,47 +885,30 @@ app.get('/u/:token/artist/:id', async c => {
           cacheTrackMeta(t.id, tTitle, tArtist);
           redisCacheTrackMeta(String(t.id), tTitle, tArtist);
           return {
-            id: String(t.id),
-            title: tTitle,
-            artist: tArtist,
+            id: String(t.id), title: tTitle, artist: tArtist,
             duration: trackDuration(t),
             artworkURL: coverUrl(t.album?.cover || t.album?.image || t.album?.artwork),
           };
         });
 
-      // ── Step 6: Build albums — deduplicate, sort newest first ────────────────
-      const seenAlbumIds = new Set();
-      const albums = albumSources
-        .filter(a => {
-          if (!a?.id) return false;
-          const k = String(a.id);
-          if (seenAlbumIds.has(k)) return false;
-          seenAlbumIds.add(k);
-          return true;
-        })
+      // ── Step 6: Build albums ──────────────────────────────────────────────────
+      const albums = Object.values(albumMap)
         .sort((a, b) => {
           const ya = a.releaseDate ? parseInt(String(a.releaseDate).slice(0, 4), 10) : 0;
           const yb = b.releaseDate ? parseInt(String(b.releaseDate).slice(0, 4), 10) : 0;
           if (yb !== ya) return yb - ya;
           return (b.releaseDate || '').localeCompare(a.releaseDate || '');
         })
-        .slice(0, 100)
         .map(al => ({
-          id: String(al.id),
-          title: al.title || 'Unknown',
-          artist: artistName,
+          id: String(al.id), title: al.title || 'Unknown', artist: artistName,
           artworkURL: coverUrl(al.cover || al.image || al.artwork),
           trackCount: al.numberOfTracks,
           year: al.releaseDate ? String(al.releaseDate).slice(0, 4) : undefined,
         }));
 
       return Response.json({
-        id: String(artistInfo.id || aid),
-        name: artistName,
-        artworkURL,
-        bio: null,
-        topTracks,
-        albums,
+        id: String(artistInfo.id || aid), name: artistName,
+        artworkURL, bio: null, topTracks, albums,
       });
     } catch(e) {
       return Response.json({ error: 'Artist fetch failed: ' + e.message }, { status: 502 });
