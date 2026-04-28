@@ -109,6 +109,28 @@ if (n.includes(q) || q.includes(n)) return 2;
 return 0;
 }
 
+// ─── Extract title/artist from any HiFi response shape ────────────────────────
+function extractTrackMeta(raw) {
+if (!raw) return null;
+// Walk all likely locations the HiFi API might put track metadata
+const candidates = [
+raw,
+raw.data,
+raw.data && raw.data.track,
+raw.data && raw.data.metadata,
+raw.track,
+raw.metadata,
+raw.item,
+raw.data && raw.data.item,
+];
+for (const c of candidates) {
+if (c && typeof c === 'object' && c.title && typeof c.title === 'string') {
+return { title: c.title, artist: trackArtist(c) };
+}
+}
+return null;
+}
+
 // ─── Qobuz client ──────────────────────────────────────────────────────────────────
 async function qobuzStream(trackId) {
 for (const fmt of [27, 7, 6, 5]) {
@@ -216,6 +238,46 @@ return;
 } catch(e) {}
 }
 instanceHealthy = false;
+}
+
+// ─── Resolve title+artist for a TIDAL track ID ────────────────────────────────
+// Tries multiple HiFi API endpoints in order until one returns a title.
+async function resolveTidalMeta(inst, tid) {
+// 1) /trackmetadata — dedicated metadata endpoint on some instances
+const meta1 = await hifiGetForTokenSafe(inst, '/trackmetadata', { id: tid });
+const r1 = extractTrackMeta(meta1);
+if (r1) { console.log('meta via /trackmetadata:', JSON.stringify(r1)); return r1; }
+
+// 2) /search with the numeric ID as a text query — some instances return full track objects
+const meta2 = await hifiGetForTokenSafe(inst, '/search', { s: tid, limit: 5, offset: 0 });
+if (meta2) {
+const items = meta2.data?.items || meta2.items || [];
+const match = items.find(t => t && String(t.id) === String(tid));
+if (match && match.title) {
+const r2 = { title: match.title, artist: trackArtist(match) };
+console.log('meta via /search by id:', JSON.stringify(r2));
+return r2;
+}
+// log the first item shape for debugging
+if (items[0]) console.log('meta /search id shape sample:', JSON.stringify(Object.keys(items[0])));
+}
+
+// 3) /track with LOSSLESS — on some instances the wrapper includes full track data
+const meta3 = await hifiGetForTokenSafe(inst, '/track', { id: tid, quality: 'LOSSLESS' });
+if (meta3) {
+console.log('meta /track LOSSLESS top-level keys:', JSON.stringify(Object.keys(meta3)));
+if (meta3.data) console.log('meta /track LOSSLESS data keys:', JSON.stringify(Object.keys(meta3.data)));
+}
+const r3 = extractTrackMeta(meta3);
+if (r3) { console.log('meta via /track LOSSLESS:', JSON.stringify(r3)); return r3; }
+
+// 4) /track with HIGH
+const meta4 = await hifiGetForTokenSafe(inst, '/track', { id: tid, quality: 'HIGH' });
+const r4 = extractTrackMeta(meta4);
+if (r4) { console.log('meta via /track HIGH:', JSON.stringify(r4)); return r4; }
+
+console.log('meta: all lookups failed for tid', tid);
+return null;
 }
 
 // ─── Upstash Redis REST API ───────────────────────────────────────────────────
@@ -661,50 +723,34 @@ const tid = c.req.param('id');
 const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
 
-// Step 1: get title+artist from query params if Eclipse passed them
+// Step 1: title+artist from Eclipse query params
 let qTitle = String(c.req.query('title') || '').trim();
 let qArtist = String(c.req.query('artist') || '').trim();
 
-// Step 2: if no title, fetch track metadata from TIDAL /track endpoint (not /search)
+// Step 2: if missing, resolve from TIDAL using all available endpoints
 if (!qTitle) {
-try {
-// Try LOSSLESS first for metadata, then HIGH as fallback
-const metaData = await hifiGetForTokenSafe(inst, '/track', { id: tid, quality: 'LOSSLESS' })
-|| await hifiGetForTokenSafe(inst, '/track', { id: tid, quality: 'HIGH' });
-if (metaData) {
-// HiFi API wraps response in .data for track metadata
-const meta = metaData.data || metaData;
-// meta.track holds the track info on some instances
-const trackMeta = meta.track || meta;
-if (trackMeta && trackMeta.title) {
-qTitle = trackMeta.title;
-qArtist = trackArtist(trackMeta);
-console.log('qobuz: resolved metadata for', tid, '->', qTitle, 'by', qArtist);
-}
-}
-} catch(e) {
-console.warn('qobuz: metadata fetch failed for', tid, e.message);
-}
+const meta = await resolveTidalMeta(inst, tid);
+if (meta) { qTitle = meta.title; qArtist = meta.artist; }
 }
 
-// Step 3: try Qobuz Hi-Res with resolved title+artist
+// Step 3: Qobuz Hi-Res
 if (qTitle) {
 try {
 const qTrack = await qobuzFindBestTrack(qTitle, qArtist);
 if (qTrack && qTrack.id) {
 const qStream = await qobuzStream(qTrack.id);
 if (qStream) {
-console.log('qobuz: HIT', qTitle, 'by', qArtist, '-> qobuz id', qTrack.id, qStream.quality);
+console.log('qobuz: HIT', qTitle, 'by', qArtist, '->', qTrack.id, qStream.quality);
 return Response.json(qStream);
 }
 }
 } catch(e) {
-console.warn('qobuz: stream error for', qTitle, e.message);
+console.warn('qobuz: error', e.message);
 }
 }
 
 // Step 4: TIDAL fallback
-console.log('qobuz: MISS for tid', tid, qTitle ? '(no qobuz match)' : '(no metadata)', '- falling back to TIDAL');
+console.log('qobuz: MISS tid', tid, qTitle || '(no meta)', '- TIDAL fallback');
 const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
 const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
 const qualities = pref
@@ -858,17 +904,19 @@ results.push({ quality: ql, status: 'ok', payloadKeys: Object.keys(payload), has
 results.push({ quality: ql, status: 'error', error: e.message });
 }
 }
+const resolvedMeta = await resolveTidalMeta(inst, tid);
 let qobuzResult = null;
-const titleToTest = qTitle || tid;
+const titleToTest = qTitle || (resolvedMeta && resolvedMeta.title) || tid;
+const artistToTest = qArtist || (resolvedMeta && resolvedMeta.artist) || '';
 try {
-const qTrack = await qobuzFindBestTrack(titleToTest, qArtist);
-qobuzResult = { searched: titleToTest, artist: qArtist, matched: qTrack ? { id: qTrack.id, title: qTrack.title } : null };
+const qTrack = await qobuzFindBestTrack(titleToTest, artistToTest);
+qobuzResult = { searched: titleToTest, artist: artistToTest, matched: qTrack ? { id: qTrack.id, title: qTrack.title } : null };
 if (qTrack) {
 const qStream = await qobuzStream(qTrack.id);
 qobuzResult.stream = qStream;
 }
 } catch(e) { qobuzResult = { error: e.message }; }
-return Response.json({ trackId: tid, qTitle, qArtist, inst: inst || activeInstance, qobuz: qobuzResult, tidal: results });
+return Response.json({ trackId: tid, resolvedMeta, qobuz: qobuzResult, tidal: results });
 });
 });
 
