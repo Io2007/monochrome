@@ -520,15 +520,13 @@ return Response.json(parsed);
 }
 
 try {
-// Fire main search + dedicated playlist search in parallel.
-// The HiFi API exposes playlists via type=PLAYLISTS on the /search/ endpoint
-// (trailing slash matters on some instances). The main search response may also
-// contain a playlists field on certain instances, so we check both.
+// Fire track search + playlist search in parallel.
+// Track search: GET /search/?s=query  (returns tracks, albums, artists)
+// Playlist search: GET /search/?p=query  (TIDAL top-hits PLAYLISTS via HiFi proxy)
 const [mainResult, plResult] = await Promise.allSettled([
   hifiGetForToken(inst, '/search', { s: q, limit, offset: 0 }),
-  hifiGetForTokenSafe(inst, '/search/', { s: q, type: 'PLAYLISTS', limit: 10 }),
+  hifiGetForTokenSafe(inst, '/search', { p: q, limit: 10, offset: 0 }),
 ]);
-
 const data  = mainResult.status === 'fulfilled' ? (mainResult.value || null) : null;
 // Items array (tracks) at data.data.items OR data.items
 const items = data?.data?.items || data?.items || [];
@@ -559,32 +557,30 @@ const artistList = Object.keys(artistMap)
 .sort((a, b) => (artistRelevance(artistMap[b].name, q) * 100 + (artistHits[b] || 0)) - (artistRelevance(artistMap[a].name, q) * 100 + (artistHits[a] || 0)))
 .slice(0, 5).map(k => artistMap[k]);
 
-// ── Merge playlists from both sources ────────────────────────────────────────
-// Source 1: dedicated type=PLAYLISTS search response
-// HiFi returns: { data: { items: [...] } } or { items: [...] } or { playlists: { items: [...] } }
+// ── Playlists from dedicated p= search + fallback embedded field ─────────────
+// The HiFi proxy calls TIDAL's top-hits?types=PLAYLISTS endpoint via GET /search/?p=query.
+// Response shape: { data: { playlists: { items: [...] } } }
+// Each playlist has: uuid, title, squareImage, image, creator, numberOfTracks
 const plData = plResult.status === 'fulfilled' ? (plResult.value || null) : null;
-const plDedicated = plData?.data?.items || plData?.data?.playlists?.items
-  || plData?.data?.playlists || plData?.playlists?.items
-  || plData?.playlists || plData?.items || [];
-// Source 2: playlists embedded in the main search response
+const plFromSearch = plData?.data?.playlists?.items || plData?.data?.playlists
+  || plData?.playlists?.items || plData?.playlists || plData?.data?.items || plData?.items || [];
+// Also check if the main search response has a playlists field (some instances embed them)
 const plEmbedded = data?.data?.playlists?.items || data?.data?.playlists
   || data?.playlists?.items || data?.playlists || [];
-// Source 3: any playlist-shaped objects mixed into the main items array
-const plMixed = items.filter(looksLikePlaylist);
 
 const seenPlIds = new Set();
 const plItems = [];
-for (const p of [...(Array.isArray(plDedicated) ? plDedicated : []),
-                  ...(Array.isArray(plEmbedded)  ? plEmbedded  : []),
-                  ...plMixed]) {
+for (const p of [...(Array.isArray(plFromSearch) ? plFromSearch : []),
+                  ...(Array.isArray(plEmbedded)   ? plEmbedded   : [])]) {
   if (!p) continue;
   const pid = String(p.uuid || p.id || '');
-  if (!pid || seenPlIds.has(pid)) continue;
+  // Only real TIDAL playlists — UUID format, never numeric track IDs
+  if (!pid || !isPlaylistUUID(pid) || seenPlIds.has(pid)) continue;
   seenPlIds.add(pid);
   plItems.push({
     id: pid,
     title: p.title || 'Playlist',
-    creator: p.creator?.name,
+    creator: p.creator?.name || (p.type === 'EDITORIAL' ? 'TIDAL' : undefined),
     artworkURL: coverUrl(p.squareImage || p.image || p.cover, 1280),
     trackCount: p.numberOfTracks || p.trackCount,
   });
@@ -963,9 +959,9 @@ const tTitle = t.title || 'Unknown';
 const tArtist = trackArtist(t);
 cacheTrackMeta(t.id, tTitle, tArtist);
 redisCacheTrackMeta(String(t.id), tTitle, tArtist);
-return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover) };
+return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover, 1280) };
 }).filter(Boolean);
-return Response.json({ id: String(pl?.uuid || pl?.id || pid), title: pl?.title || 'Playlist', creator: pl?.creator?.name, artworkURL: (pl?.squareImage || pl?.image) ? coverUrl(pl.squareImage || pl.image, 480) : undefined, trackCount: pl?.numberOfTracks || tracks.length, tracks });
+return Response.json({ id: String(pl?.uuid || pl?.id || pid), title: pl?.title || 'Playlist', creator: pl?.creator?.name, artworkURL: (pl?.squareImage || pl?.image) ? coverUrl(pl.squareImage || pl.image, 1280) : undefined, trackCount: pl?.numberOfTracks || tracks.length, tracks });
 } catch(e) {
 return Response.json({ error: 'Playlist fetch failed: ' + e.message }, { status: 502 });
 }
