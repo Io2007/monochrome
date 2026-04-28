@@ -520,13 +520,11 @@ return Response.json(parsed);
 }
 
 try {
-const [mainResult, plResult] = await Promise.allSettled([
-hifiGetForToken(inst, '/search', { s: q, limit, offset: 0 }),
-hifiGetForTokenSafe(inst, '/search', { s: q, type: 'PLAYLISTS', limit: 10, offset: 0 })
-]);
-
-const data = mainResult.status === 'fulfilled' ? mainResult.value : null;
-const items = data ? (data.data?.items || data.items || []) : [];
+// Single search request — playlists live inside the main response, not a separate endpoint
+const mainResult = await hifiGetForToken(inst, '/search', { s: q, limit, offset: 0 });
+const data  = mainResult || null;
+// Items array (tracks) lives at data.data.items or data.items
+const items = data?.data?.items || data?.items || [];
 
 const albumMap = {}, artistMap = {}, artistHits = {}, tracks = [];
 for (let i = 0; i < items.length; i++) {
@@ -534,7 +532,7 @@ const t = items[i];
 if (!t || !t.id) continue;
 if (t.album && t.album.id) {
 const abid = String(t.album.id);
-if (!albumMap[abid]) albumMap[abid] = { id: abid, title: t.album.title || 'Unknown', artist: trackArtist(t), artworkURL: coverUrl(t.album.cover), trackCount: t.album.numberOfTracks, year: t.album.releaseDate ? String(t.album.releaseDate).slice(0, 4) : undefined };
+if (!albumMap[abid]) albumMap[abid] = { id: abid, title: t.album.title || 'Unknown', artist: trackArtist(t), artworkURL: coverUrl(t.album.cover, 1280), trackCount: t.album.numberOfTracks, year: t.album.releaseDate ? String(t.album.releaseDate).slice(0, 4) : undefined };
 }
 (t.artists || (t.artist ? [t.artist] : [])).forEach(a => {
 if (!a || !a.id) return;
@@ -545,24 +543,40 @@ artistHits[arid] = (artistHits[arid] || 0) + 1;
 if (t.streamReady === false || t.allowStreaming === false) continue;
 const tTitle = t.title || 'Unknown';
 const tArtist = trackArtist(t);
-// ★ Cache title+artist by track ID for use at stream time
 cacheTrackMeta(t.id, tTitle, tArtist);
 redisCacheTrackMeta(String(t.id), tTitle, tArtist);
-tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null), format: 'flac' });
+tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1280), format: 'flac' });
 }
 
 const artistList = Object.keys(artistMap)
 .sort((a, b) => (artistRelevance(artistMap[b].name, q) * 100 + (artistHits[b] || 0)) - (artistRelevance(artistMap[a].name, q) * 100 + (artistHits[a] || 0)))
 .slice(0, 5).map(k => artistMap[k]);
 
+// Extract playlists — HiFi API returns them in several possible locations:
+// data.data.playlists.items, data.data.playlists, data.playlists.items,
+// data.playlists, or mixed into the items array itself (looksLikePlaylist check)
 let plItems = [];
-if (plResult.status === 'fulfilled' && plResult.value) {
-const raw = plResult.value;
-const rawItems = raw.data?.playlists?.items || raw.data?.playlists || raw.data?.items || raw.playlists?.items || raw.playlists || raw.items || (Array.isArray(raw.data) ? raw.data : []);
-const realPlaylists = rawItems.filter(looksLikePlaylist);
-if (realPlaylists.length > 0) {
-plItems = realPlaylists.slice(0, 5).map(p => ({ id: String(p.uuid || p.id), title: p.title || 'Playlist', creator: p.creator?.name, artworkURL: coverUrl(p.squareImage || p.image), trackCount: p.numberOfTracks })).filter(p => p.id);
-}
+const plRaw = data?.data?.playlists?.items
+  || data?.data?.playlists
+  || data?.playlists?.items
+  || data?.playlists
+  || [];
+// Also catch any playlist objects mixed into the main items array
+const mixedPl = items.filter(looksLikePlaylist);
+const allPl = [...(Array.isArray(plRaw) ? plRaw : []), ...mixedPl];
+const seenPlIds = new Set();
+for (const p of allPl) {
+  const pid = String(p.uuid || p.id || '');
+  if (!pid || seenPlIds.has(pid)) continue;
+  seenPlIds.add(pid);
+  plItems.push({
+    id: pid,
+    title: p.title || 'Playlist',
+    creator: p.creator?.name,
+    artworkURL: coverUrl(p.squareImage || p.image, 1280),
+    trackCount: p.numberOfTracks,
+  });
+  if (plItems.length >= 8) break;
 }
 
 const result = { tracks, albums: Object.values(albumMap).slice(0, 8), artists: artistList, playlists: plItems };
@@ -684,9 +698,9 @@ try {
     const tArtist = trackArtist(t) || artistName;
     cacheTrackMeta(t.id, tTitle, tArtist);
     redisCacheTrackMeta(String(t.id), tTitle, tArtist);
-    return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(cover) };
+    return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(cover, 1280) };
   }).filter(Boolean);
-  return Response.json({ id: String(album?.id || aid), title: album?.title || 'Unknown', artist: artistName, artworkURL: coverUrl(cover, 640), year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album?.numberOfTracks || tracks.length, tracks });
+  return Response.json({ id: String(album?.id || aid), title: album?.title || 'Unknown', artist: artistName, artworkURL: coverUrl(cover, 1280), year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album?.numberOfTracks || tracks.length, tracks });
 } catch(e) {
   return Response.json({ error: 'Album fetch failed: ' + e.message }, { status: 502 });
 }
@@ -887,7 +901,7 @@ app.get('/u/:token/artist/:id', async c => {
           return {
             id: String(t.id), title: tTitle, artist: tArtist,
             duration: trackDuration(t),
-            artworkURL: coverUrl(t.album?.cover || t.album?.image || t.album?.artwork),
+            artworkURL: coverUrl(t.album?.cover || t.album?.image || t.album?.artwork, 1280),
           };
         });
 
@@ -901,7 +915,7 @@ app.get('/u/:token/artist/:id', async c => {
         })
         .map(al => ({
           id: String(al.id), title: al.title || 'Unknown', artist: artistName,
-          artworkURL: coverUrl(al.cover || al.image || al.artwork),
+          artworkURL: coverUrl(al.cover || al.image || al.artwork, 1280),
           trackCount: al.numberOfTracks,
           year: al.releaseDate ? String(al.releaseDate).slice(0, 4) : undefined,
         }));
