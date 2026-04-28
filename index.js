@@ -2,10 +2,7 @@
  * Eclipse Universal Addon
  * Sources (in priority order):
  *   MUSIC:    HiFi instances → SoundCloud → Internet Archive
- *   PODCASTS: Podcast Index → Taddy → Apple Podcasts
- *   AUDIOBOOKS: LibriVox → Internet Archive
- *   RADIO:    Radio Browser
- *
+ *   PODCASTS: Podcast Index → Taddy → Apple Podcasts 
  * All API keys are optional and passed via query string when installing:
  *   https://your-addon.vercel.app/{token}/manifest.json
  *
