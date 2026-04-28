@@ -520,10 +520,17 @@ return Response.json(parsed);
 }
 
 try {
-// Single search request — playlists live inside the main response, not a separate endpoint
-const mainResult = await hifiGetForToken(inst, '/search', { s: q, limit, offset: 0 });
-const data  = mainResult || null;
-// Items array (tracks) lives at data.data.items or data.items
+// Fire main search + dedicated playlist search in parallel.
+// The HiFi API exposes playlists via type=PLAYLISTS on the /search/ endpoint
+// (trailing slash matters on some instances). The main search response may also
+// contain a playlists field on certain instances, so we check both.
+const [mainResult, plResult] = await Promise.allSettled([
+  hifiGetForToken(inst, '/search', { s: q, limit, offset: 0 }),
+  hifiGetForTokenSafe(inst, '/search/', { s: q, type: 'PLAYLISTS', limit: 10 }),
+]);
+
+const data  = mainResult.status === 'fulfilled' ? (mainResult.value || null) : null;
+// Items array (tracks) at data.data.items OR data.items
 const items = data?.data?.items || data?.items || [];
 
 const albumMap = {}, artistMap = {}, artistHits = {}, tracks = [];
@@ -552,20 +559,25 @@ const artistList = Object.keys(artistMap)
 .sort((a, b) => (artistRelevance(artistMap[b].name, q) * 100 + (artistHits[b] || 0)) - (artistRelevance(artistMap[a].name, q) * 100 + (artistHits[a] || 0)))
 .slice(0, 5).map(k => artistMap[k]);
 
-// Extract playlists — HiFi API returns them in several possible locations:
-// data.data.playlists.items, data.data.playlists, data.playlists.items,
-// data.playlists, or mixed into the items array itself (looksLikePlaylist check)
-let plItems = [];
-const plRaw = data?.data?.playlists?.items
-  || data?.data?.playlists
-  || data?.playlists?.items
-  || data?.playlists
-  || [];
-// Also catch any playlist objects mixed into the main items array
-const mixedPl = items.filter(looksLikePlaylist);
-const allPl = [...(Array.isArray(plRaw) ? plRaw : []), ...mixedPl];
+// ── Merge playlists from both sources ────────────────────────────────────────
+// Source 1: dedicated type=PLAYLISTS search response
+// HiFi returns: { data: { items: [...] } } or { items: [...] } or { playlists: { items: [...] } }
+const plData = plResult.status === 'fulfilled' ? (plResult.value || null) : null;
+const plDedicated = plData?.data?.items || plData?.data?.playlists?.items
+  || plData?.data?.playlists || plData?.playlists?.items
+  || plData?.playlists || plData?.items || [];
+// Source 2: playlists embedded in the main search response
+const plEmbedded = data?.data?.playlists?.items || data?.data?.playlists
+  || data?.playlists?.items || data?.playlists || [];
+// Source 3: any playlist-shaped objects mixed into the main items array
+const plMixed = items.filter(looksLikePlaylist);
+
 const seenPlIds = new Set();
-for (const p of allPl) {
+const plItems = [];
+for (const p of [...(Array.isArray(plDedicated) ? plDedicated : []),
+                  ...(Array.isArray(plEmbedded)  ? plEmbedded  : []),
+                  ...plMixed]) {
+  if (!p) continue;
   const pid = String(p.uuid || p.id || '');
   if (!pid || seenPlIds.has(pid)) continue;
   seenPlIds.add(pid);
@@ -573,10 +585,10 @@ for (const p of allPl) {
     id: pid,
     title: p.title || 'Playlist',
     creator: p.creator?.name,
-    artworkURL: coverUrl(p.squareImage || p.image, 1280),
-    trackCount: p.numberOfTracks,
+    artworkURL: coverUrl(p.squareImage || p.image || p.cover, 1280),
+    trackCount: p.numberOfTracks || p.trackCount,
   });
-  if (plItems.length >= 8) break;
+  if (plItems.length >= 10) break;
 }
 
 const result = { tracks, albums: Object.values(albumMap).slice(0, 8), artists: artistList, playlists: plItems };
