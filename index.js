@@ -11,21 +11,6 @@ async function parseBody(c) {
 try { return await c.req.json(); } catch(e) { return {}; }
 }
 
-function makeRes() {
-let _status = 200;
-let _headers = { 'Content-Type': 'application/json' };
-let _body = null;
-const res = {
-_status, _headers, _body,
-status(s) { res._status = s; return res; },
-setHeader(k, v) { res._headers[k] = v; return res; },
-json(data) { res._body = JSON.stringify(data); res._headers['Content-Type'] = 'application/json'; return res; },
-send(html) { res._body = html; return res; },
-toResponse() { return new Response(res._body, { status: res._status, headers: res._headers }); }
-};
-return res;
-}
-
 const HIFI_INSTANCES = [
 'https://hifi-api-pj08.onrender.com',
 'https://tidal-api.binimum.org',
@@ -47,6 +32,24 @@ let activeInstance = HIFI_INSTANCES[0];
 let instanceHealthy = false;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
 const QOBUZ_BASE = 'https://qobuz-api1.onrender.com';
+
+// ─── In-memory track meta cache (title+artist by TIDAL id) ───────────────────
+// Populated at search time, read at stream time. Survives within the same worker instance.
+const TRACK_META_CACHE = new Map();
+
+function cacheTrackMeta(id, title, artist) {
+if (!id || !title) return;
+TRACK_META_CACHE.set(String(id), { title, artist: artist || 'Unknown' });
+// cap size to avoid unbounded growth in long-lived instances
+if (TRACK_META_CACHE.size > 5000) {
+const firstKey = TRACK_META_CACHE.keys().next().value;
+TRACK_META_CACHE.delete(firstKey);
+}
+}
+
+function getCachedMeta(id) {
+return TRACK_META_CACHE.get(String(id)) || null;
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function coverUrl(uuid, size) {
@@ -109,29 +112,7 @@ if (n.includes(q) || q.includes(n)) return 2;
 return 0;
 }
 
-// ─── Extract title/artist from any HiFi response shape ────────────────────────
-function extractTrackMeta(raw) {
-if (!raw) return null;
-// Walk all likely locations the HiFi API might put track metadata
-const candidates = [
-raw,
-raw.data,
-raw.data && raw.data.track,
-raw.data && raw.data.metadata,
-raw.track,
-raw.metadata,
-raw.item,
-raw.data && raw.data.item,
-];
-for (const c of candidates) {
-if (c && typeof c === 'object' && c.title && typeof c.title === 'string') {
-return { title: c.title, artist: trackArtist(c) };
-}
-}
-return null;
-}
-
-// ─── Qobuz client ──────────────────────────────────────────────────────────────────
+// ─── Qobuz client ─────────────────────────────────────────────────────────────
 async function qobuzStream(trackId) {
 for (const fmt of [27, 7, 6, 5]) {
 try {
@@ -189,7 +170,7 @@ return null;
 } catch(e) { return null; }
 }
 
-// ─── Hi-Fi API client — shared pool ──────────────────────────────────────────
+// ─── Hi-Fi API client ─────────────────────────────────────────────────────────
 async function hifiGet(path, params) {
 var errors = [];
 var instances = instanceHealthy
@@ -228,58 +209,6 @@ async function hifiGetForTokenSafe(instanceUrl, path, params) {
 try { return await hifiGetForToken(instanceUrl, path, params); } catch(e) { return null; }
 }
 
-async function checkInstances() {
-for (var inst of HIFI_INSTANCES) {
-try {
-await axios.get(inst + '/search', { params: { s: 'test', limit: 1 }, timeout: 8000 });
-activeInstance = inst;
-instanceHealthy = true;
-return;
-} catch(e) {}
-}
-instanceHealthy = false;
-}
-
-// ─── Resolve title+artist for a TIDAL track ID ────────────────────────────────
-// Tries multiple HiFi API endpoints in order until one returns a title.
-async function resolveTidalMeta(inst, tid) {
-// 1) /trackmetadata — dedicated metadata endpoint on some instances
-const meta1 = await hifiGetForTokenSafe(inst, '/trackmetadata', { id: tid });
-const r1 = extractTrackMeta(meta1);
-if (r1) { console.log('meta via /trackmetadata:', JSON.stringify(r1)); return r1; }
-
-// 2) /search with the numeric ID as a text query — some instances return full track objects
-const meta2 = await hifiGetForTokenSafe(inst, '/search', { s: tid, limit: 5, offset: 0 });
-if (meta2) {
-const items = meta2.data?.items || meta2.items || [];
-const match = items.find(t => t && String(t.id) === String(tid));
-if (match && match.title) {
-const r2 = { title: match.title, artist: trackArtist(match) };
-console.log('meta via /search by id:', JSON.stringify(r2));
-return r2;
-}
-// log the first item shape for debugging
-if (items[0]) console.log('meta /search id shape sample:', JSON.stringify(Object.keys(items[0])));
-}
-
-// 3) /track with LOSSLESS — on some instances the wrapper includes full track data
-const meta3 = await hifiGetForTokenSafe(inst, '/track', { id: tid, quality: 'LOSSLESS' });
-if (meta3) {
-console.log('meta /track LOSSLESS top-level keys:', JSON.stringify(Object.keys(meta3)));
-if (meta3.data) console.log('meta /track LOSSLESS data keys:', JSON.stringify(Object.keys(meta3.data)));
-}
-const r3 = extractTrackMeta(meta3);
-if (r3) { console.log('meta via /track LOSSLESS:', JSON.stringify(r3)); return r3; }
-
-// 4) /track with HIGH
-const meta4 = await hifiGetForTokenSafe(inst, '/track', { id: tid, quality: 'HIGH' });
-const r4 = extractTrackMeta(meta4);
-if (r4) { console.log('meta via /track HIGH:', JSON.stringify(r4)); return r4; }
-
-console.log('meta: all lookups failed for tid', tid);
-return null;
-}
-
 // ─── Upstash Redis REST API ───────────────────────────────────────────────────
 const UPSTASH_URL = typeof UPSTASH_REDIS_REST_URL !== 'undefined' ? UPSTASH_REDIS_REST_URL : null;
 const UPSTASH_TOKEN = typeof UPSTASH_REDIS_REST_TOKEN !== 'undefined' ? UPSTASH_REDIS_REST_TOKEN : null;
@@ -295,6 +224,19 @@ body: JSON.stringify(args)
 const json = await res.json();
 return json.result ?? null;
 } catch(e) { return null; }
+}
+
+// Save title+artist to Redis keyed by TIDAL track id (TTL 24h)
+async function redisCacheTrackMeta(tid, title, artist) {
+if (!tid || !title) return;
+await upstashCmd('SET', 'mc:tmeta:' + tid, JSON.stringify({ title, artist: artist || 'Unknown' }), 'EX', 86400);
+}
+
+// Load title+artist from Redis by TIDAL track id
+async function redisLoadTrackMeta(tid) {
+const raw = await upstashCmd('GET', 'mc:tmeta:' + tid);
+if (!raw) return null;
+try { return JSON.parse(raw); } catch(e) { return null; }
 }
 
 async function redisSave(token, entry) {
@@ -359,16 +301,29 @@ if (entry.rateWin.length >= RATE_MAX) return false;
 entry.rateWin.push(now); entry.lastUsed = now; entry.reqCount = (entry.reqCount || 0) + 1; return true;
 }
 
-async function tokenMiddleware(req, res, next) {
-var entry = await getTokenEntry(req.params.token);
-if (!entry) return res.status(404).json({ error: 'Invalid token.' });
-if (!checkRateLimit(entry)) return res.status(429).json({ error: 'Rate limit exceeded.' });
-req.tokenEntry = entry;
-if (entry.reqCount % 20 === 0) redisSave(req.params.token, entry);
-next();
+function getBaseUrl(req) { return (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host'); }
+
+// ─── withToken ────────────────────────────────────────────────────────────────
+async function withToken(c, handler) {
+const rawParam = c.req.param('token');
+const { token, embeddedInstance } = parseTokenParam(rawParam);
+const entry = await getTokenEntry(token);
+if (!entry) return Response.json({ error: 'Invalid token.' }, { status: 404 });
+if (!checkRateLimit(entry)) return Response.json({ error: 'Rate limit exceeded.' }, { status: 429 });
+if (embeddedInstance) entry.instanceUrl = embeddedInstance;
+if (entry.reqCount % 20 === 0) await redisSave(token, entry);
+return handler(entry);
 }
 
-function getBaseUrl(req) { return (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host'); }
+function parseTokenParam(rawParam) {
+const tilde = rawParam.indexOf('~');
+if (tilde === -1) return { token: rawParam, embeddedInstance: null };
+const token = rawParam.slice(0, tilde);
+try {
+const embeddedInstance = Buffer.from(rawParam.slice(tilde + 1), 'base64url').toString('utf8');
+return { token, embeddedInstance };
+} catch(e) { return { token, embeddedInstance: null }; }
+}
 
 // ─── Config page ──────────────────────────────────────────────────────────────
 function buildConfigPage(baseUrl) {
@@ -413,19 +368,15 @@ h += '.ql-btn:hover{border-color:#444;color:#aaa}';
 h += '.ql-btn.sel{background:#0d1520;border-color:#4a9eff;color:#4a9eff}';
 h += 'footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-height:1.8}';
 h += '</style></head><body>';
-
 h += '<svg width="52" height="52" viewBox="0 0 52 52" fill="none" style="margin-bottom:22px"><circle cx="26" cy="26" r="26" fill="#fff"/><rect x="10" y="20" width="4" height="12" rx="2" fill="#000"/><rect x="17" y="14" width="4" height="24" rx="2" fill="#000"/><rect x="24" y="18" width="4" height="16" rx="2" fill="#000"/><rect x="31" y="11" width="4" height="30" rx="2" fill="#000"/><rect x="38" y="17" width="4" height="18" rx="2" fill="#000"/></svg>';
-
 h += '<div class="card">';
 h += '<h1>Claudochrome for Eclipse</h1>';
 h += '<p class="sub">Full TIDAL catalog &mdash; lossless FLAC, HiRes, AAC 320 &mdash; no account, no subscription. Streams: Qobuz Hi-Res &rarr; TIDAL &rarr; fallback.</p>';
 h += '<div class="tip"><b>Save your URL.</b> Paste it below to refresh without reinstalling.</div>';
 h += '<div class="pills"><span class="pill">Tracks &middot; Albums &middot; Artists</span><span class="pill hi">FLAC / HiRes</span><span class="pill hi">AAC 320</span><span class="pill hi">Qobuz 24-bit</span></div>';
-
 h += '<div class="lbl">Custom Hi&#8209;Fi Instance <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 h += '<input type="text" id="customInstance" placeholder="https://your-instance.example.com">';
 h += '<div class="hint">Leave blank to use the shared pool. Paste your own self-hosted Hi-Fi API URL to lock this token exclusively to your instance.</div>';
-
 h += '<div class="lbl">Preferred Audio Quality <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 h += '<div class="ql-row">';
 h += '<div class="ql-btn" id="ql-HI_RES_LOSSLESS" onclick="selectQuality(\'HI_RES_LOSSLESS\')">Hi-Res Max<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">TIDAL MAX / MQA</span></div>';
@@ -434,17 +385,14 @@ h += '<div class="ql-btn" id="ql-HIGH" onclick="selectQuality(\'HIGH\')">AAC 320
 h += '<div class="ql-btn" id="ql-LOW" onclick="selectQuality(\'LOW\')">AAC 96<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">AAC 96 kbps</span></div>';
 h += '</div>';
 h += '<div class="hint" id="qlHint">No preference &mdash; addon auto-selects: Qobuz Hi-Res &rarr; TIDAL Lossless &rarr; AAC 320 &rarr; AAC 96.</div>';
-
 h += '<button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
 h += '<div class="box" id="genBox"><div class="badge" id="genBadge">&#10003; Locked to your custom instance</div><div class="blbl">Your addon URL &mdash; paste into Eclipse</div><div class="burl" id="genUrl"></div><button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button></div>';
-
 h += '<hr>';
 h += '<div class="lbl">Refresh existing URL</div>';
 h += '<input type="text" id="existingUrl" placeholder="Paste your existing addon URL here">';
 h += '<div class="hint">Keeps the same URL active &mdash; nothing to reinstall.</div>';
 h += '<button class="bg" id="refBtn" onclick="doRefresh()">Refresh Existing URL</button>';
 h += '<div class="box" id="refBox"><div class="blbl">Refreshed &mdash; same URL still works in Eclipse</div><div class="burl" id="refUrl"></div><button class="bd" id="copyRefBtn" onclick="copyRef()">Copy URL</button></div>';
-
 h += '<hr>';
 h += '<div class="steps">';
 h += '<div class="step"><div class="sn">1</div><div class="st">Generate and copy your URL above</div></div>';
@@ -454,94 +402,25 @@ h += '<div class="step"><div class="sn">4</div><div class="st">Search TIDAL\'s f
 h += '</div>';
 h += '<div class="warn">Stream priority: <b>Qobuz Hi-Res 24-bit</b> &rarr; TIDAL Lossless/HiRes &rarr; lower quality fallback. Searches always use TIDAL catalog.</div>';
 h += '</div>';
-
 h += '<div class="card">';
 h += '<h2>Instance Health</h2>';
 h += '<p class="sub" style="margin-bottom:14px">Live status of all Hi-Fi API v2.7 instances.</p>';
 h += '<div class="inst-list" id="instList"><div style="color:#333;font-size:13px">Checking...</div></div>';
 h += '<button class="bg" style="margin-top:14px" onclick="checkHealth()">Refresh Status</button>';
 h += '</div>';
-
-h += '<footer>Claudochrome Eclipse Addon v2.2.0 &bull; TIDAL search + Qobuz Hi-Res streams</footer>';
-
+h += '<footer>Claudochrome Eclipse Addon v2.3.0 &bull; TIDAL search + Qobuz Hi-Res streams</footer>';
 h += '<script>';
 h += 'var gu,ru,selQ=null;';
 h += 'var QLABELS={"HI_RES_LOSSLESS":"Hi-Res Max (TIDAL MAX / MQA)","LOSSLESS":"Lossless (FLAC 16-bit CD)","HIGH":"AAC 320 kbps","LOW":"AAC 96 kbps"};';
-h += 'function selectQuality(q){';
-h += 'if(selQ===q)selQ=null;else selQ=q;';
-h += '["HI_RES_LOSSLESS","LOSSLESS","HIGH","LOW"].forEach(function(k){';
-h += 'document.getElementById("ql-"+k).classList.toggle("sel",selQ===k);';
-h += '});';
-h += 'document.getElementById("qlHint").textContent=selQ';
-h += '?"Preferred: "+QLABELS[selQ]+" \u2014 fallback to lower if unavailable."';
-h += ':"\u00a0No preference \u2014 auto-selects: Qobuz Hi-Res \u2192 TIDAL Lossless \u2192 AAC 320 \u2192 AAC 96.";';
-h += '}';
-h += 'function generate(){';
-h += 'var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";';
-h += 'var ci=document.getElementById("customInstance").value.trim();';
-h += 'while(ci.length&&ci[ci.length-1]=="/")ci=ci.slice(0,-1);';
-h += 'var body={};';
-h += 'if(ci)body.instanceUrl=ci;';
-h += 'if(selQ)body.preferredQuality=selQ;';
-h += 'fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})';
-h += '.then(function(r){return r.json();})';
-h += '.then(function(d){';
-h += 'if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}';
-h += 'gu=d.manifestUrl;';
-h += 'document.getElementById("genUrl").textContent=gu;';
-h += 'document.getElementById("genBadge").style.display=d.usingCustomInstance?"block":"none";';
-h += 'document.getElementById("genBox").style.display="block";';
-h += 'btn.disabled=false;btn.textContent="Regenerate URL";';
-h += '})';
-h += '.catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});';
-h += '}';
+h += 'function selectQuality(q){if(selQ===q)selQ=null;else selQ=q;["HI_RES_LOSSLESS","LOSSLESS","HIGH","LOW"].forEach(function(k){document.getElementById("ql-"+k).classList.toggle("sel",selQ===k);});document.getElementById("qlHint").textContent=selQ?"Preferred: "+QLABELS[selQ]+" \u2014 fallback to lower if unavailable.":"\u00a0No preference \u2014 auto-selects: Qobuz Hi-Res \u2192 TIDAL Lossless \u2192 AAC 320 \u2192 AAC 96.";}';
+h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";var ci=document.getElementById("customInstance").value.trim();while(ci.length&&ci[ci.length-1]=="/")ci=ci.slice(0,-1);var body={};if(ci)body.instanceUrl=ci;if(selQ)body.preferredQuality=selQ;fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}gu=d.manifestUrl;document.getElementById("genUrl").textContent=gu;document.getElementById("genBadge").style.display=d.usingCustomInstance?"block":"none";document.getElementById("genBox").style.display="block";btn.disabled=false;btn.textContent="Regenerate URL";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});}';
 h += 'function copyGen(){if(!gu)return;navigator.clipboard.writeText(gu).then(function(){var b=document.getElementById("copyGenBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);});}';
-h += 'function doRefresh(){';
-h += 'var btn=document.getElementById("refBtn");';
-h += 'var eu=document.getElementById("existingUrl").value.trim();';
-h += 'if(!eu){alert("Paste your existing addon URL first.");return;}';
-h += 'btn.disabled=true;btn.textContent="Refreshing...";';
-h += 'fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu})})';
-h += '.then(function(r){return r.json();})';
-h += '.then(function(d){';
-h += 'if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Refresh Existing URL";return;}';
-h += 'ru=d.manifestUrl;document.getElementById("refUrl").textContent=ru;';
-h += 'document.getElementById("refBox").style.display="block";';
-h += 'btn.disabled=false;btn.textContent="Refresh Again";';
-h += '})';
-h += '.catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Refresh Existing URL";});';
-h += '}';
+h += 'function doRefresh(){var btn=document.getElementById("refBtn");var eu=document.getElementById("existingUrl").value.trim();if(!eu){alert("Paste your existing addon URL first.");return;}btn.disabled=true;btn.textContent="Refreshing...";fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu})}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Refresh Existing URL";return;}ru=d.manifestUrl;document.getElementById("refUrl").textContent=ru;document.getElementById("refBox").style.display="block";btn.disabled=false;btn.textContent="Refresh Again";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Refresh Existing URL";});}';
 h += 'function copyRef(){if(!ru)return;navigator.clipboard.writeText(ru).then(function(){var b=document.getElementById("copyRefBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);});}';
-h += 'function checkHealth(){var list=document.getElementById("instList");list.innerHTML=\'<div style="color:#333;font-size:13px">Checking...</div>\';';
-h += 'fetch("/instances").then(function(r){return r.json();}).then(function(data){list.innerHTML="";data.instances.forEach(function(inst){var row=document.createElement("div");row.className="inst";var dot=document.createElement("span");dot.className=inst.ok?"dot ok":"dot err";var urlSpan=document.createElement("span");urlSpan.className="inst-url";function maskUrl(u){var pre="https://";if(u.startsWith(pre)){var rest=u.slice(pre.length);return pre+rest.slice(0,6)+"\u2022".repeat(Math.max(0,rest.length-6));}return u.slice(0,14)+"\u2022".repeat(Math.max(0,u.length-14));}urlSpan.textContent=maskUrl(inst.url);row.appendChild(dot);row.appendChild(urlSpan);if(inst.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.textContent=inst.ms+"ms";row.appendChild(ms);}list.appendChild(row);});}).catch(function(){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Could not reach server</div>\';});}';
+h += 'function checkHealth(){var list=document.getElementById("instList");list.innerHTML=\'<div style="color:#333;font-size:13px">Checking...</div>\';fetch("/instances").then(function(r){return r.json();}).then(function(data){list.innerHTML="";data.instances.forEach(function(inst){var row=document.createElement("div");row.className="inst";var dot=document.createElement("span");dot.className=inst.ok?"dot ok":"dot err";var urlSpan=document.createElement("span");urlSpan.className="inst-url";function maskUrl(u){var pre="https://";if(u.startsWith(pre)){var rest=u.slice(pre.length);return pre+rest.slice(0,6)+"\u2022".repeat(Math.max(0,rest.length-6));}return u.slice(0,14)+"\u2022".repeat(Math.max(0,u.length-14));}urlSpan.textContent=maskUrl(inst.url);row.appendChild(dot);row.appendChild(urlSpan);if(inst.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.textContent=inst.ms+"ms";row.appendChild(ms);}list.appendChild(row);});}).catch(function(){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Could not reach server</div>\';});}';
 h += 'checkHealth();';
 h += '</script></body></html>';
 return h;
-}
-
-// ─── parseTokenParam ──────────────────────────────────────────────────────────
-function parseTokenParam(rawParam) {
-const tilde = rawParam.indexOf('~');
-if (tilde === -1) return { token: rawParam, embeddedInstance: null };
-const token = rawParam.slice(0, tilde);
-try {
-const embeddedInstance = Buffer.from(rawParam.slice(tilde + 1), 'base64url').toString('utf8');
-return { token, embeddedInstance };
-} catch(e) {
-return { token, embeddedInstance: null };
-}
-}
-
-// ─── withToken ────────────────────────────────────────────────────────────────
-async function withToken(c, handler) {
-const rawParam = c.req.param('token');
-const { token, embeddedInstance } = parseTokenParam(rawParam);
-const entry = await getTokenEntry(token);
-if (!entry) return Response.json({ error: 'Invalid token.' }, { status: 404 });
-if (!checkRateLimit(entry)) return Response.json({ error: 'Rate limit exceeded.' }, { status: 429 });
-if (embeddedInstance) entry.instanceUrl = embeddedInstance;
-if (entry.reqCount % 20 === 0) await redisSave(token, entry);
-return handler(entry);
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -554,43 +433,24 @@ app.post('/generate', async c => {
 const body = await parseBody(c);
 const ip = (c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown').split(',')[0].trim();
 const bucket = getOrCreateIpBucket(ip);
-if (bucket.count >= MAX_TOKENS_PER_IP) {
-return Response.json({ error: 'Too many tokens from this IP today.' }, { status: 429 });
-}
-
+if (bucket.count >= MAX_TOKENS_PER_IP) return Response.json({ error: 'Too many tokens from this IP today.' }, { status: 429 });
 let instanceUrl = (body && body.instanceUrl) ? String(body.instanceUrl).trim().replace(/\/$/, '') : null;
 if (instanceUrl) {
-if (!/^https?:\/\//.test(instanceUrl)) {
-return Response.json({ error: 'Instance URL must start with http or https' }, { status: 400 });
-}
+if (!/^https?:\/\//.test(instanceUrl)) return Response.json({ error: 'Instance URL must start with http or https' }, { status: 400 });
 try {
 await axios.get(instanceUrl + '/search', { params: { s: 'test', limit: 1 }, timeout: 8000 });
-} catch(e) {
-return Response.json({ error: 'Could not reach your instance: ' + e.message }, { status: 400 });
+} catch(e) { return Response.json({ error: 'Could not reach your instance: ' + e.message }, { status: 400 }); }
 }
-}
-
 const VALID_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
-const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality))
-? body.preferredQuality : null;
-
+const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality)) ? body.preferredQuality : null;
 const token = generateToken();
 const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality };
 TOKEN_CACHE.set(token, entry);
 await redisSave(token, entry);
 bucket.count++;
-
 const baseUrl = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
-const tokenSegment = instanceUrl
-? token + '~' + Buffer.from(instanceUrl).toString('base64url')
-: token;
-
-return Response.json({
-token,
-manifestUrl: baseUrl + '/u/' + tokenSegment + '/manifest.json',
-usingCustomInstance: !!instanceUrl,
-preferredQuality
-});
+const tokenSegment = instanceUrl ? token + '~' + Buffer.from(instanceUrl).toString('base64url') : token;
+return Response.json({ token, manifestUrl: baseUrl + '/u/' + tokenSegment + '/manifest.json', usingCustomInstance: !!instanceUrl, preferredQuality });
 });
 
 app.post('/refresh', async c => {
@@ -600,23 +460,13 @@ const segMatch = raw.match(/\/u\/([^/]+)\/manifest\.json/);
 const rawSegment = segMatch ? segMatch[1] : raw;
 const { token: parsedToken } = parseTokenParam(rawSegment);
 const token = parsedToken;
-if (!token || !/^[a-f0-9]{28}$/.test(token)) {
-return Response.json({ error: 'Paste your full addon URL.' }, { status: 400 });
-}
+if (!token || !/^[a-f0-9]{28}$/.test(token)) return Response.json({ error: 'Paste your full addon URL.' }, { status: 400 });
 const entry = await getTokenEntry(token);
-if (!entry) {
-return Response.json({ error: 'URL not found. Generate a new one.' }, { status: 404 });
-}
+if (!entry) return Response.json({ error: 'URL not found. Generate a new one.' }, { status: 404 });
 const baseUrl = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
 const instanceUrl = entry.instanceUrl;
-const tokenSegment = instanceUrl
-? token + '~' + Buffer.from(instanceUrl).toString('base64url')
-: token;
-return Response.json({
-token,
-manifestUrl: baseUrl + '/u/' + tokenSegment + '/manifest.json',
-refreshed: true
-});
+const tokenSegment = instanceUrl ? token + '~' + Buffer.from(instanceUrl).toString('base64url') : token;
+return Response.json({ token, manifestUrl: baseUrl + '/u/' + tokenSegment + '/manifest.json', refreshed: true });
 });
 
 app.get('/instances', async c => {
@@ -631,7 +481,7 @@ return Response.json({ instances: results });
 });
 
 app.get('/health', c => {
-return Response.json({ status: 'ok', version: '2.2.0', activeInstance, instanceHealthy, qobuzBase: QOBUZ_BASE, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
+return Response.json({ status: 'ok', version: '2.3.0', activeInstance, instanceHealthy, qobuzBase: QOBUZ_BASE, cachedTracks: TRACK_META_CACHE.size, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
 });
 
 app.get('/u/:token/manifest.json', async c => {
@@ -641,7 +491,7 @@ const { token } = parseTokenParam(rawParam);
 return Response.json({
 id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
 name: 'Claudochrome',
-version: '2.2.0',
+version: '2.3.0',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
 icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQeDbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQs10',
 resources: ['search', 'stream', 'catalog'],
@@ -650,7 +500,7 @@ types: ['track', 'album', 'artist', 'playlist']
 });
 });
 
-// ─── Search — TIDAL only ────────────────────────────────────────────────────────
+// ─── Search — TIDAL + cache track meta for stream ─────────────────────────────
 app.get('/u/:token/search', async c => {
 return withToken(c, async entry => {
 const q = String(c.req.query('q') || c.req.query('query') || c.req.query('s') || '').trim();
@@ -661,7 +511,12 @@ if (!q) return Response.json({ tracks: [], albums: [], artists: [], playlists: [
 const cacheKey = 'mc:search:' + (inst || 'pool') + ':' + q.toLowerCase() + ':' + limit;
 const cached = await upstashCmd('GET', cacheKey);
 if (cached) {
-try { return Response.json(JSON.parse(cached)); } catch(e) {}
+try {
+const parsed = JSON.parse(cached);
+// Re-populate in-memory meta cache from cached search results
+if (parsed.tracks) parsed.tracks.forEach(t => { if (t && t.id && t.title) cacheTrackMeta(t.id, t.title, t.artist); });
+return Response.json(parsed);
+} catch(e) {}
 }
 
 try {
@@ -671,9 +526,7 @@ hifiGetForTokenSafe(inst, '/search', { s: q, type: 'PLAYLISTS', limit: 10, offse
 ]);
 
 const data = mainResult.status === 'fulfilled' ? mainResult.value : null;
-const items = data
-? (data.data && data.data.items ? data.data.items : data.items ? data.items : [])
-: [];
+const items = data ? (data.data?.items || data.items || []) : [];
 
 const albumMap = {}, artistMap = {}, artistHits = {}, tracks = [];
 for (let i = 0; i < items.length; i++) {
@@ -690,7 +543,12 @@ if (!artistMap[arid]) artistMap[arid] = { id: arid, name: a.name || 'Unknown', a
 artistHits[arid] = (artistHits[arid] || 0) + 1;
 });
 if (t.streamReady === false || t.allowStreaming === false) continue;
-tracks.push({ id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t), album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null), format: 'flac' });
+const tTitle = t.title || 'Unknown';
+const tArtist = trackArtist(t);
+// ★ Cache title+artist by track ID for use at stream time
+cacheTrackMeta(t.id, tTitle, tArtist);
+redisCacheTrackMeta(String(t.id), tTitle, tArtist);
+tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null), format: 'flac' });
 }
 
 const artistList = Object.keys(artistMap)
@@ -723,17 +581,25 @@ const tid = c.req.param('id');
 const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
 
-// Step 1: title+artist from Eclipse query params
+// Step 1: title+artist from Eclipse query params (some clients send these)
 let qTitle = String(c.req.query('title') || '').trim();
 let qArtist = String(c.req.query('artist') || '').trim();
 
-// Step 2: if missing, resolve from TIDAL using all available endpoints
+// Step 2: look up from in-memory cache (populated at search time)
 if (!qTitle) {
-const meta = await resolveTidalMeta(inst, tid);
-if (meta) { qTitle = meta.title; qArtist = meta.artist; }
+const mem = getCachedMeta(tid);
+if (mem) { qTitle = mem.title; qArtist = mem.artist; console.log('meta: hit in-memory cache for', tid, '->', qTitle); }
 }
 
-// Step 3: Qobuz Hi-Res
+// Step 3: look up from Redis (survives across worker instances / restarts)
+if (!qTitle) {
+const redisMeta = await redisLoadTrackMeta(tid);
+if (redisMeta) { qTitle = redisMeta.title; qArtist = redisMeta.artist; console.log('meta: hit Redis cache for', tid, '->', qTitle); }
+}
+
+if (!qTitle) console.log('meta: no cache for tid', tid, '- skipping Qobuz');
+
+// Step 4: Qobuz Hi-Res with resolved title+artist
 if (qTitle) {
 try {
 const qTrack = await qobuzFindBestTrack(qTitle, qArtist);
@@ -744,18 +610,16 @@ console.log('qobuz: HIT', qTitle, 'by', qArtist, '->', qTrack.id, qStream.qualit
 return Response.json(qStream);
 }
 }
+console.log('qobuz: no match for', qTitle, 'by', qArtist, '- TIDAL fallback');
 } catch(e) {
 console.warn('qobuz: error', e.message);
 }
 }
 
-// Step 4: TIDAL fallback
-console.log('qobuz: MISS tid', tid, qTitle || '(no meta)', '- TIDAL fallback');
+// Step 5: TIDAL fallback
 const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
 const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
-const qualities = pref
-? [pref, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(pref))]
-: AUTO_QUALITIES;
+const qualities = pref ? [pref, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(pref))] : AUTO_QUALITIES;
 
 for (let qi = 0; qi < qualities.length; qi++) {
 const ql = qualities[qi];
@@ -786,6 +650,7 @@ return Response.json({ error: 'No stream found for track ' + tid }, { status: 40
 });
 });
 
+// ─── Album ────────────────────────────────────────────────────────────────────
 app.get('/u/:token/album/:id', async c => {
 return withToken(c, async entry => {
 const aid = c.req.param('id');
@@ -798,7 +663,11 @@ const artistName = album.artist?.name || album.artists?.map(a => a.name).join(',
 const tracks = rawItems.map((item, i) => {
 const t = item.item || item;
 if (!t || !t.id || t.streamReady === false) return null;
-return { id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t) || artistName, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(album.cover) };
+const tTitle = t.title || 'Unknown';
+const tArtist = trackArtist(t) || artistName;
+cacheTrackMeta(t.id, tTitle, tArtist);
+redisCacheTrackMeta(String(t.id), tTitle, tArtist);
+return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(album.cover) };
 }).filter(Boolean);
 return Response.json({ id: String(album.id || aid), title: album.title || 'Unknown', artist: artistName, artworkURL: coverUrl(album.cover, 640), year: album.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album.numberOfTracks || tracks.length, tracks });
 } catch(e) {
@@ -807,6 +676,7 @@ return Response.json({ error: 'Album fetch failed: ' + e.message }, { status: 50
 });
 });
 
+// ─── Artist ───────────────────────────────────────────────────────────────────
 app.get('/u/:token/artist/:id', async c => {
 return withToken(c, async entry => {
 const aid = parseInt(c.req.param('id'), 10);
@@ -847,7 +717,13 @@ const artistName = artistInfo.name || 'Unknown';
 const artworkURL = coverData ? coverData[750] : coverUrl(artistInfo.picture, 480);
 const topTracks = allTracks.filter(t => t?.id && t.streamReady !== false && t.allowStreaming !== false)
 .sort((a, b) => (b.popularity || 0) - (a.popularity || 0)).slice(0, 20)
-.map(t => ({ id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t) || artistName, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover) }));
+.map(t => {
+const tTitle = t.title || 'Unknown';
+const tArtist = trackArtist(t) || artistName;
+cacheTrackMeta(t.id, tTitle, tArtist);
+redisCacheTrackMeta(String(t.id), tTitle, tArtist);
+return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover) };
+});
 const albums = albumItems.filter(a => a?.id)
 .sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || '')).slice(0, 60)
 .map(al => ({ id: String(al.id), title: al.title || 'Unknown', artist: artistName, artworkURL: coverUrl(al.cover), trackCount: al.numberOfTracks, year: al.releaseDate ? String(al.releaseDate).slice(0, 4) : undefined }));
@@ -858,6 +734,7 @@ return Response.json({ error: 'Artist fetch failed: ' + e.message }, { status: 5
 });
 });
 
+// ─── Playlist ─────────────────────────────────────────────────────────────────
 app.get('/u/:token/playlist/:id', async c => {
 return withToken(c, async entry => {
 const pid = c.req.param('id');
@@ -874,49 +751,16 @@ else { pl = data; rawItems = data.items || []; }
 const tracks = rawItems.map(item => {
 const t = item.item || item;
 if (!t || !t.id || t.streamReady === false) return null;
-return { id: String(t.id), title: t.title || 'Unknown', artist: trackArtist(t), duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover) };
+const tTitle = t.title || 'Unknown';
+const tArtist = trackArtist(t);
+cacheTrackMeta(t.id, tTitle, tArtist);
+redisCacheTrackMeta(String(t.id), tTitle, tArtist);
+return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover) };
 }).filter(Boolean);
 return Response.json({ id: String(pl?.uuid || pl?.id || pid), title: pl?.title || 'Playlist', creator: pl?.creator?.name, artworkURL: (pl?.squareImage || pl?.image) ? coverUrl(pl.squareImage || pl.image, 480) : undefined, trackCount: pl?.numberOfTracks || tracks.length, tracks });
 } catch(e) {
 return Response.json({ error: 'Playlist fetch failed: ' + e.message }, { status: 502 });
 }
-});
-});
-
-// ─── Debug route ──────────────────────────────────────────────────────────────
-app.get('/u/:token/debug/stream/:id', async c => {
-return withToken(c, async entry => {
-const tid = c.req.param('id');
-const inst = entry.instanceUrl;
-const qTitle = String(c.req.query('title') || '').trim();
-const qArtist = String(c.req.query('artist') || '').trim();
-const results = [];
-for (const ql of ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW']) {
-try {
-const data = await hifiGetForToken(inst, '/track', { id: tid, quality: ql });
-const payload = data && data.data ? data.data : data;
-let manifestDecoded = null;
-if (payload && payload.manifest) {
-try { manifestDecoded = JSON.parse(Buffer.from(payload.manifest, 'base64').toString('utf8')); } catch(e) { manifestDecoded = 'parse_error: ' + e.message; }
-}
-results.push({ quality: ql, status: 'ok', payloadKeys: Object.keys(payload), hasManifest: !!payload?.manifest, manifestDecoded, directUrl: payload?.url || null, audioQuality: payload?.audioQuality || null });
-} catch(e) {
-results.push({ quality: ql, status: 'error', error: e.message });
-}
-}
-const resolvedMeta = await resolveTidalMeta(inst, tid);
-let qobuzResult = null;
-const titleToTest = qTitle || (resolvedMeta && resolvedMeta.title) || tid;
-const artistToTest = qArtist || (resolvedMeta && resolvedMeta.artist) || '';
-try {
-const qTrack = await qobuzFindBestTrack(titleToTest, artistToTest);
-qobuzResult = { searched: titleToTest, artist: artistToTest, matched: qTrack ? { id: qTrack.id, title: qTrack.title } : null };
-if (qTrack) {
-const qStream = await qobuzStream(qTrack.id);
-qobuzResult.stream = qStream;
-}
-} catch(e) { qobuzResult = { error: e.message }; }
-return Response.json({ trackId: tid, resolvedMeta, qobuz: qobuzResult, tidal: results });
 });
 });
 
