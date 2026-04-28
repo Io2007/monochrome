@@ -678,60 +678,147 @@ return Response.json({ error: 'Album fetch failed: ' + e.message }, { status: 50
 
 // ─── Artist ───────────────────────────────────────────────────────────────────
 app.get('/u/:token/artist/:id', async c => {
-return withToken(c, async entry => {
-const aid = parseInt(c.req.param('id'), 10);
-const inst = entry.instanceUrl;
-if (isNaN(aid)) return Response.json({ error: 'Invalid artist ID' }, { status: 400 });
-try {
-const infoData = await hifiGetForToken(inst, '/artist', { id: aid });
-let artistInfo = infoData.artist?.id ? infoData.artist : infoData.data?.artist?.id ? infoData.data.artist : infoData.id ? infoData : infoData.data?.id ? infoData.data : {};
-const coverData = infoData.cover;
-let albumItems = [], allTracks = [];
-try {
-const discData = await hifiGetForToken(inst, '/artist/f', { aid, skiptracks: false });
-albumItems = Array.isArray(discData.albums) ? discData.albums : discData.albums?.items || [];
-allTracks = Array.isArray(discData.tracks) ? discData.tracks : discData.tracks?.items || [];
-} catch(e) {}
-if (!albumItems.length) {
-try {
-const albData = await hifiGetForToken(inst, '/artist/albums', { id: aid, limit: 50, offset: 0 });
-albumItems = Array.isArray(albData) ? albData : albData.items || albData.data?.items || albData.data || [];
-} catch(e) {}
-}
-if (!albumItems.length && artistInfo.name) {
-try {
-const sData = await hifiGetForToken(inst, '/search', { s: artistInfo.name, limit: 20, offset: 0 });
-const sItems = sData?.data?.items || [];
-const aMap = {};
-sItems.forEach(t => {
-if (!t?.album?.id) return;
-const tArt = trackArtist(t).toLowerCase(), want = (artistInfo.name || '').toLowerCase();
-if (!tArt.includes(want) && !want.includes(tArt)) return;
-const alId = String(t.album.id);
-if (!aMap[alId]) aMap[alId] = { id: alId, title: t.album.title, cover: t.album.cover, releaseDate: t.album.releaseDate, numberOfTracks: t.album.numberOfTracks };
-});
-albumItems = Object.values(aMap);
-} catch(e) {}
-}
-const artistName = artistInfo.name || 'Unknown';
-const artworkURL = coverData ? coverData[750] : coverUrl(artistInfo.picture, 480);
-const topTracks = allTracks.filter(t => t?.id && t.streamReady !== false && t.allowStreaming !== false)
-.sort((a, b) => (b.popularity || 0) - (a.popularity || 0)).slice(0, 20)
-.map(t => {
-const tTitle = t.title || 'Unknown';
-const tArtist = trackArtist(t) || artistName;
-cacheTrackMeta(t.id, tTitle, tArtist);
-redisCacheTrackMeta(String(t.id), tTitle, tArtist);
-return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover) };
-});
-const albums = albumItems.filter(a => a?.id)
-.sort((a, b) => (b.releaseDate || '').localeCompare(a.releaseDate || '')).slice(0, 60)
-.map(al => ({ id: String(al.id), title: al.title || 'Unknown', artist: artistName, artworkURL: coverUrl(al.cover), trackCount: al.numberOfTracks, year: al.releaseDate ? String(al.releaseDate).slice(0, 4) : undefined }));
-return Response.json({ id: String(artistInfo.id || aid), name: artistName, artworkURL, bio: null, topTracks, albums });
-} catch(e) {
-return Response.json({ error: 'Artist fetch failed: ' + e.message }, { status: 502 });
-}
-});
+  return withToken(c, async entry => {
+    const aid = parseInt(c.req.param('id'), 10);
+    const inst = entry.instanceUrl;
+    if (isNaN(aid)) return Response.json({ error: 'Invalid artist ID' }, { status: 400 });
+    try {
+      // ── Step 1: Artist info + cover ─────────────────────────────────────────
+      const infoData = await hifiGetForToken(inst, '/artist', { id: aid });
+      let artistInfo = infoData.artist?.id ? infoData.artist
+        : infoData.data?.artist?.id ? infoData.data.artist
+        : infoData.id ? infoData
+        : infoData.data?.id ? infoData.data : {};
+      const coverData = infoData.cover;
+      const artistName = artistInfo.name || 'Unknown';
+      const artworkURL = coverData ? (coverData[750] || coverData[480] || coverData[320])
+        : coverUrl(artistInfo.picture, 480);
+
+      // ── Step 2: Fetch albums + top tracks in parallel ────────────────────────
+      let albumItems = [], allTracks = [];
+
+      // Primary: /artist/f (returns both albums and tracks in one call)
+      try {
+        const discData = await hifiGetForToken(inst, '/artist/f', { aid, skiptracks: false });
+        albumItems = Array.isArray(discData.albums) ? discData.albums : (discData.albums?.items || []);
+        allTracks  = Array.isArray(discData.tracks) ? discData.tracks : (discData.tracks?.items || []);
+      } catch(e) {}
+
+      // Parallel fallback fetches if primary missed albums or top tracks
+      const [albFallback, topFallback] = await Promise.allSettled([
+        // Album fallback: dedicated /artist/albums with higher limit
+        (albumItems.length === 0)
+          ? hifiGetForToken(inst, '/artist/albums', { id: aid, limit: 100, offset: 0 })
+          : Promise.resolve(null),
+        // Top-tracks fallback: dedicated /artist/toptracks endpoint
+        (allTracks.length === 0)
+          ? hifiGetForToken(inst, '/artist/toptracks', { id: aid, limit: 30, offset: 0 })
+          : Promise.resolve(null),
+      ]);
+
+      if (albumItems.length === 0 && albFallback.status === 'fulfilled' && albFallback.value) {
+        const d = albFallback.value;
+        albumItems = Array.isArray(d) ? d : (d.items || d.data?.items || d.data || []);
+      }
+      if (allTracks.length === 0 && topFallback.status === 'fulfilled' && topFallback.value) {
+        const d = topFallback.value;
+        allTracks = Array.isArray(d) ? d : (d.items || d.data?.items || d.tracks?.items || d.tracks || d.data || []);
+      }
+
+      // Last-resort album fallback: search by artist name and collect unique albums
+      if (albumItems.length === 0 && artistName !== 'Unknown') {
+        try {
+          const sData = await hifiGetForToken(inst, '/search', { s: artistName, limit: 50, offset: 0 });
+          const sItems = sData?.data?.items || sData?.items || [];
+          const aMap = {};
+          sItems.forEach(t => {
+            if (!t?.album?.id) return;
+            const alId = String(t.album.id);
+            if (!aMap[alId]) aMap[alId] = {
+              id: alId,
+              title: t.album.title,
+              cover: t.album.cover,
+              releaseDate: t.album.releaseDate,
+              numberOfTracks: t.album.numberOfTracks,
+            };
+          });
+          albumItems = Object.values(aMap);
+        } catch(e) {}
+      }
+
+      // Last-resort top-tracks fallback: search artist name, take matching tracks
+      if (allTracks.length === 0 && artistName !== 'Unknown') {
+        try {
+          const sData = await hifiGetForToken(inst, '/search', { s: artistName, limit: 50, offset: 0 });
+          const sItems = sData?.data?.items || sData?.items || [];
+          const want = artistName.toLowerCase();
+          allTracks = sItems.filter(t => {
+            if (!t?.id || t.streamReady === false) return false;
+            const ar = trackArtist(t).toLowerCase();
+            return ar.includes(want) || want.includes(ar);
+          });
+        } catch(e) {}
+      }
+
+      // ── Step 3: Build topTracks ──────────────────────────────────────────────
+      const topTracks = allTracks
+        .filter(t => t?.id && t.streamReady !== false && t.allowStreaming !== false)
+        .sort((a, b) => (b.popularity || 0) - (a.popularity || 0))
+        .slice(0, 20)
+        .map(t => {
+          const tTitle  = t.title || 'Unknown';
+          const tArtist = trackArtist(t) || artistName;
+          cacheTrackMeta(t.id, tTitle, tArtist);
+          redisCacheTrackMeta(String(t.id), tTitle, tArtist);
+          return {
+            id: String(t.id),
+            title: tTitle,
+            artist: tArtist,
+            duration: trackDuration(t),
+            artworkURL: coverUrl(t.album?.cover || t.album?.image),
+          };
+        });
+
+      // ── Step 4: Build albums — deduplicate, sort newest first ────────────────
+      const seenAlbumIds = new Set();
+      const albums = albumItems
+        .filter(a => {
+          if (!a?.id) return false;
+          const k = String(a.id);
+          if (seenAlbumIds.has(k)) return false;
+          seenAlbumIds.add(k);
+          return true;
+        })
+        .sort((a, b) => {
+          // Proper date sort: parse year from releaseDate string (YYYY or YYYY-MM-DD)
+          const ya = a.releaseDate ? parseInt(String(a.releaseDate).slice(0, 4), 10) : 0;
+          const yb = b.releaseDate ? parseInt(String(b.releaseDate).slice(0, 4), 10) : 0;
+          if (yb !== ya) return yb - ya;
+          // Same year: lexicographic fallback on full date string
+          return (b.releaseDate || '').localeCompare(a.releaseDate || '');
+        })
+        .slice(0, 100)
+        .map(al => ({
+          id: String(al.id),
+          title: al.title || 'Unknown',
+          artist: artistName,
+          artworkURL: coverUrl(al.cover || al.image || al.artwork),
+          trackCount: al.numberOfTracks,
+          year: al.releaseDate ? String(al.releaseDate).slice(0, 4) : undefined,
+        }));
+
+      return Response.json({
+        id: String(artistInfo.id || aid),
+        name: artistName,
+        artworkURL,
+        bio: null,
+        topTracks,
+        albums,
+      });
+    } catch(e) {
+      return Response.json({ error: 'Artist fetch failed: ' + e.message }, { status: 502 });
+    }
+  });
 });
 
 // ─── Playlist ─────────────────────────────────────────────────────────────────
