@@ -713,42 +713,58 @@ app.get('/u/:token/artist/:id', async c => {
         : coverUrl(artistInfo.picture, 480);
 
       // ── Step 2: Fetch everything in parallel ─────────────────────────────────
-      // Run all data fetches simultaneously: discography, toptracks, albums, search
-      const [discResult, topResult, albResult, searchResult] = await Promise.allSettled([
+      // /artist/albums only returns one content type at a time — we must request each
+      // type separately: ALBUMS, EPSSINGLES, COMPILATIONS. All run in parallel.
+      const [
+        discResult, topResult, searchResult,
+        albAlbumsResult, albEpsResult, albCompResult,
+      ] = await Promise.allSettled([
         hifiGetForToken(inst, '/artist/f', { aid, skiptracks: false }),
         hifiGetForToken(inst, '/artist/toptracks', { id: aid, limit: 30, offset: 0 }),
-        hifiGetForToken(inst, '/artist/albums', { id: aid, limit: 100, offset: 0 }),
         hifiGetForToken(inst, '/search', { s: artistName, limit: 50, offset: 0 }),
+        hifiGetForToken(inst, '/artist/albums', { id: aid, filter: 'ALBUMS',        limit: 100, offset: 0 }),
+        hifiGetForToken(inst, '/artist/albums', { id: aid, filter: 'EPSSINGLES',    limit: 100, offset: 0 }),
+        hifiGetForToken(inst, '/artist/albums', { id: aid, filter: 'COMPILATIONS',  limit: 100, offset: 0 }),
       ]);
+
+      // Helper: unwrap any HiFi /artist/albums response shape into a plain array
+      function unwrapAlbums(d) {
+        if (!d) return [];
+        if (Array.isArray(d)) return d;
+        if (Array.isArray(d.items)) return d.items;
+        if (Array.isArray(d.data?.items)) return d.data.items;
+        if (Array.isArray(d.data)) return d.data;
+        return [];
+      }
+
+      // Helper: if a page came back full (100 items) fetch next page too
+      async function fetchPage2IfNeeded(result, filter) {
+        if (result.status !== 'fulfilled' || !result.value) return [];
+        const page1 = unwrapAlbums(result.value);
+        if (page1.length < 100) return page1;
+        try {
+          const d2 = await hifiGetForToken(inst, '/artist/albums', { id: aid, filter, limit: 100, offset: 100 });
+          return [...page1, ...unwrapAlbums(d2)];
+        } catch(_) { return page1; }
+      }
 
       // ── Step 3: Collect album items from all sources ─────────────────────────
       const albumSources = [];
+
+      // From /artist/f discography (combined endpoint — best single source)
       if (discResult.status === 'fulfilled' && discResult.value) {
         const d = discResult.value;
         const a = Array.isArray(d.albums) ? d.albums : (d.albums?.items || d.albums || []);
         albumSources.push(...a);
       }
-      if (albResult.status === 'fulfilled' && albResult.value) {
-        const d = albResult.value;
-        // Unwrap all known shapes: plain array, { items }, { data: { items } }, { data: [] }
-        const a = Array.isArray(d) ? d
-          : Array.isArray(d.items) ? d.items
-          : Array.isArray(d.data?.items) ? d.data.items
-          : Array.isArray(d.data) ? d.data
-          : [];
-        albumSources.push(...a);
-        // If we got a full page of 100, try fetching a 2nd page (some artists have many albums)
-        if (a.length >= 100) {
-          try {
-            const d2 = await hifiGetForToken(inst, '/artist/albums', { id: aid, limit: 100, offset: 100 });
-            const a2 = Array.isArray(d2) ? d2
-              : Array.isArray(d2?.items) ? d2.items
-              : Array.isArray(d2?.data?.items) ? d2.data.items
-              : Array.isArray(d2?.data) ? d2.data : [];
-            albumSources.push(...a2);
-          } catch(_) {}
-        }
-      }
+
+      // From dedicated per-type album fetches (Albums, EPs/Singles, Compilations)
+      const [albumsPage, epsPage, compPage] = await Promise.all([
+        fetchPage2IfNeeded(albAlbumsResult, 'ALBUMS'),
+        fetchPage2IfNeeded(albEpsResult,    'EPSSINGLES'),
+        fetchPage2IfNeeded(albCompResult,   'COMPILATIONS'),
+      ]);
+      albumSources.push(...albumsPage, ...epsPage, ...compPage);
 
       // ── Step 4: Collect track candidates from all sources ────────────────────
       const trackSources = [];
