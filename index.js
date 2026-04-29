@@ -38,9 +38,9 @@ let activeQobuzInstance = QOBUZ_INSTANCES[0];
 // Populated at search time, read at stream time. Survives within the same worker instance.
 const TRACK_META_CACHE = new Map();
 
-function cacheTrackMeta(id, title, artist) {
+function cacheTrackMeta(id, title, artist, isrc) {
 if (!id || !title) return;
-TRACK_META_CACHE.set(String(id), { title, artist: artist || 'Unknown' });
+TRACK_META_CACHE.set(String(id), { title, artist: artist || 'Unknown', isrc: isrc || null });
 // cap size to avoid unbounded growth in long-lived instances
 if (TRACK_META_CACHE.size > 5000) {
 const firstKey = TRACK_META_CACHE.keys().next().value;
@@ -184,9 +184,49 @@ async function qobuzStream(trackId) {
   return null;
 }
 
-// qobuzFindBestTrack: search result cached 1h — no more Qobuz search on every stream request.
-// Negative results (no match) cached 30 min to prevent hammering on unmatchable tracks.
-async function qobuzFindBestTrack(title, artist) {
+// qobuzFindByIsrc: ISRC is a permanent unique code — result cached 24h.
+// Most reliable match method: bypasses fuzzy title+artist matching entirely.
+async function qobuzFindByIsrc(isrc) {
+  if (!isrc) return null;
+  const cacheKey = 'qisrc:' + isrc.toUpperCase();
+  const cached = cGet(cacheKey);
+  if (cached === 'MISS') return null;
+  if (cached) return cached;
+
+  for (const inst of QOBUZ_INSTANCES) {
+    try {
+      const r = await axios.get(inst + '/search', {
+        params: { q: 'isrc:' + isrc, limit: 5 },
+        headers: { 'User-Agent': UA },
+        timeout: 8000
+      });
+      const items = (r.data && r.data.tracks && r.data.tracks.items) ? r.data.tracks.items : [];
+      // Qobuz returns the exact track when ISRC matches
+      const match = items.find(t => t.isrc && t.isrc.toUpperCase() === isrc.toUpperCase()) || items[0];
+      if (match && match.id) {
+        if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
+        cSet(cacheKey, match, 86400); // ISRC→track ID never changes — cache 24h
+        console.log('qobuz isrc: HIT', isrc, '->', match.id, match.title);
+        return match;
+      }
+    } catch(e) { continue; }
+  }
+  cSet(cacheKey, 'MISS', 3600); // ISRC miss cached 1h (not on Qobuz)
+  return null;
+}
+
+// qobuzFindBestTrack: tries ISRC first (exact match), falls back to title+artist fuzzy search.
+// ISRC results cached 24h; title+artist results cached 1h; misses cached 30 min.
+async function qobuzFindBestTrack(title, artist, isrc) {
+  // 1. ISRC fast path — exact match, no fuzzy logic needed
+  if (isrc) {
+    const byIsrc = await qobuzFindByIsrc(isrc);
+    if (byIsrc) return byIsrc;
+    // ISRC miss means track isn't on Qobuz — skip title search to avoid false positives
+    console.log('qobuz: ISRC miss for', isrc, '- skipping title search');
+    return null;
+  }
+
   if (!title) return null;
   const cacheKey = 'qmatch:' + title.toLowerCase() + ':' + (artist || '').toLowerCase();
   const cached = cGet(cacheKey);
@@ -307,13 +347,13 @@ return json.result ?? null;
 } catch(e) { return null; }
 }
 
-// Save title+artist to Redis keyed by TIDAL track id (TTL 24h)
-async function redisCacheTrackMeta(tid, title, artist) {
+// Save title+artist+isrc to Redis keyed by TIDAL track id (TTL 24h)
+async function redisCacheTrackMeta(tid, title, artist, isrc) {
 if (!tid || !title) return;
-await upstashCmd('SET', 'mc:tmeta:' + tid, JSON.stringify({ title, artist: artist || 'Unknown' }), 'EX', 86400);
+await upstashCmd('SET', 'mc:tmeta:' + tid, JSON.stringify({ title, artist: artist || 'Unknown', isrc: isrc || null }), 'EX', 86400);
 }
 
-// Load title+artist from Redis by TIDAL track id
+// Load title+artist+isrc from Redis by TIDAL track id
 async function redisLoadTrackMeta(tid) {
 const raw = await upstashCmd('GET', 'mc:tmeta:' + tid);
 if (!raw) return null;
@@ -565,7 +605,7 @@ app.get('/instances', async c => {
 });
 
 app.get('/health', c => {
-return Response.json({ status: 'ok', version: '2.3.0', activeInstance, instanceHealthy, qobuzBase: activeQobuzInstance, cachedTracks: TRACK_META_CACHE.size, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
+return Response.json({ status: 'ok', version: '2.4.0', activeInstance, instanceHealthy, qobuzBase: activeQobuzInstance, cachedTracks: TRACK_META_CACHE.size, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
 });
 
 app.get('/u/:token/manifest.json', async c => {
@@ -635,8 +675,8 @@ artistHits[arid] = (artistHits[arid] || 0) + 1;
 if (t.streamReady === false || t.allowStreaming === false) continue;
 const tTitle = t.title || 'Unknown';
 const tArtist = trackArtist(t);
-cacheTrackMeta(t.id, tTitle, tArtist);
-redisCacheTrackMeta(String(t.id), tTitle, tArtist);
+cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
+redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
 tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: 'flac' });
 }
 
@@ -698,31 +738,32 @@ let qTitle = String(c.req.query('title') || '').trim();
 let qArtist = String(c.req.query('artist') || '').trim();
 
 // Step 2: look up from in-memory cache (populated at search time)
+let qIsrc = String(c.req.query('isrc') || '').trim() || null;
 if (!qTitle) {
 const mem = getCachedMeta(tid);
-if (mem) { qTitle = mem.title; qArtist = mem.artist; console.log('meta: hit in-memory cache for', tid, '->', qTitle); }
+if (mem) { qTitle = mem.title; qArtist = mem.artist; if (!qIsrc) qIsrc = mem.isrc || null; console.log('meta: hit in-memory cache for', tid, '->', qTitle, qIsrc ? '(isrc: ' + qIsrc + ')' : ''); }
 }
 
 // Step 3: look up from Redis (survives across worker instances / restarts)
 if (!qTitle) {
 const redisMeta = await redisLoadTrackMeta(tid);
-if (redisMeta) { qTitle = redisMeta.title; qArtist = redisMeta.artist; console.log('meta: hit Redis cache for', tid, '->', qTitle); }
+if (redisMeta) { qTitle = redisMeta.title; qArtist = redisMeta.artist; if (!qIsrc) qIsrc = redisMeta.isrc || null; console.log('meta: hit Redis cache for', tid, '->', qTitle, qIsrc ? '(isrc: ' + qIsrc + ')' : ''); }
 }
 
-if (!qTitle) console.log('meta: no cache for tid', tid, '- skipping Qobuz');
+if (!qTitle && !qIsrc) console.log('meta: no cache for tid', tid, '- skipping Qobuz');
 
-// Step 4: Qobuz Hi-Res with resolved title+artist
-if (qTitle) {
+// Step 4: Qobuz Hi-Res — ISRC exact match first, title+artist fuzzy fallback
+if (qTitle || qIsrc) {
 try {
-const qTrack = await qobuzFindBestTrack(qTitle, qArtist);
+const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc);
 if (qTrack && qTrack.id) {
 const qStream = await qobuzStream(qTrack.id);
 if (qStream) {
-console.log('qobuz: HIT', qTitle, 'by', qArtist, '->', qTrack.id, qStream.quality);
+console.log('qobuz: HIT', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '->', qTrack.id, qStream.quality);
 return Response.json(qStream);
 }
 }
-console.log('qobuz: no match for', qTitle, 'by', qArtist, '- TIDAL fallback');
+console.log('qobuz: no match for', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '- TIDAL fallback');
 } catch(e) {
 console.warn('qobuz: error', e.message);
 }
@@ -796,8 +837,8 @@ try {
     if (!t || !t.id) return null;
     const tTitle = t.title || 'Unknown';
     const tArtist = trackArtist(t) || artistName;
-    cacheTrackMeta(t.id, tTitle, tArtist);
-    redisCacheTrackMeta(String(t.id), tTitle, tArtist);
+    cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
+    redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
     return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(cover, 1080) };
   }).filter(Boolean);
   return Response.json({ id: String(album?.id || aid), title: album?.title || 'Unknown', artist: artistName, artworkURL: coverUrl(cover, 1080), year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album?.numberOfTracks || tracks.length, tracks });
@@ -996,8 +1037,8 @@ app.get('/u/:token/artist/:id', async c => {
         .map(t => {
           const tTitle  = t.title || 'Unknown';
           const tArtist = trackArtist(t) || artistName;
-          cacheTrackMeta(t.id, tTitle, tArtist);
-          redisCacheTrackMeta(String(t.id), tTitle, tArtist);
+          cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
+          redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
           return {
             id: String(t.id), title: tTitle, artist: tArtist,
             duration: trackDuration(t),
@@ -1049,8 +1090,8 @@ const t = item.item || item;
 if (!t || !t.id || t.streamReady === false) return null;
 const tTitle = t.title || 'Unknown';
 const tArtist = trackArtist(t);
-cacheTrackMeta(t.id, tTitle, tArtist);
-redisCacheTrackMeta(String(t.id), tTitle, tArtist);
+cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
+redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
 return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover, 1080) };
 }).filter(Boolean);
 return Response.json({ id: String(pl?.uuid || pl?.id || pid), title: pl?.title || 'Playlist', creator: pl?.creator?.name, artworkURL: (pl?.squareImage || pl?.image) ? coverUrl(pl.squareImage || pl.image, 1080) : undefined, trackCount: pl?.numberOfTracks || tracks.length, tracks });
