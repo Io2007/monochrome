@@ -13,6 +13,7 @@ try { return await c.req.json(); } catch(e) { return {}; }
 
 const HIFI_INSTANCES = [
 'https://hifi-api-pj08.onrender.com',
+'https://api.iwakura.workers.dev',
 'https://tidal-api.binimum.org',
 'https://triton.squid.wtf',
 'https://ohio-1.monochrome.tf',
