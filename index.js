@@ -184,11 +184,17 @@ async function qobuzStream(trackId) {
   return null;
 }
 
-// qobuzFindByIsrc: ISRC is a permanent unique code — result cached 24h.
-// Most reliable match method: bypasses fuzzy title+artist matching entirely.
+// qobuzFindByIsrc: looks up a Qobuz track by ISRC.
+// ONLY returns a result if the Qobuz item's own .isrc field matches exactly —
+// if the proxy doesn't support ISRC search syntax the result is silently discarded.
+// Result cached 24h on confirmed hit; miss cached 30 min.
 async function qobuzFindByIsrc(isrc) {
   if (!isrc) return null;
-  const cacheKey = 'qisrc:' + isrc.toUpperCase();
+  const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const wantIsrc = norm(isrc);
+  if (!wantIsrc) return null;
+
+  const cacheKey = 'qisrc:' + wantIsrc;
   const cached = cGet(cacheKey);
   if (cached === 'MISS') return null;
   if (cached) return cached;
@@ -196,35 +202,34 @@ async function qobuzFindByIsrc(isrc) {
   for (const inst of QOBUZ_INSTANCES) {
     try {
       const r = await axios.get(inst + '/search', {
-        params: { q: 'isrc:' + isrc, limit: 5 },
+        params: { q: isrc, limit: 5 },
         headers: { 'User-Agent': UA },
         timeout: 8000
       });
       const items = (r.data && r.data.tracks && r.data.tracks.items) ? r.data.tracks.items : [];
-      // Qobuz returns the exact track when ISRC matches
-      const match = items.find(t => t.isrc && t.isrc.toUpperCase() === isrc.toUpperCase()) || items[0];
+      // STRICT: only accept a result if Qobuz confirms the ISRC matches exactly
+      const match = items.find(t => t.isrc && norm(t.isrc) === wantIsrc);
       if (match && match.id) {
         if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-        cSet(cacheKey, match, 86400); // ISRC→track ID never changes — cache 24h
+        cSet(cacheKey, match, 86400); // confirmed ISRC match — cache 24h
         console.log('qobuz isrc: HIT', isrc, '->', match.id, match.title);
         return match;
       }
     } catch(e) { continue; }
   }
-  cSet(cacheKey, 'MISS', 3600); // ISRC miss cached 1h (not on Qobuz)
+  cSet(cacheKey, 'MISS', 1800); // miss cached 30 min — try again later
   return null;
 }
 
 // qobuzFindBestTrack: tries ISRC first (exact match), falls back to title+artist fuzzy search.
 // ISRC results cached 24h; title+artist results cached 1h; misses cached 30 min.
 async function qobuzFindBestTrack(title, artist, isrc) {
-  // 1. ISRC fast path — exact match, no fuzzy logic needed
+  // 1. ISRC fast path — confirmed exact match wins immediately
   if (isrc) {
     const byIsrc = await qobuzFindByIsrc(isrc);
     if (byIsrc) return byIsrc;
-    // ISRC miss means track isn't on Qobuz — skip title search to avoid false positives
-    console.log('qobuz: ISRC miss for', isrc, '- skipping title search');
-    return null;
+    // ISRC didn't return a confirmed match — fall through to title+artist search
+    console.log('qobuz: ISRC no confirmed match for', isrc, '- falling back to title search');
   }
 
   if (!title) return null;
@@ -605,7 +610,7 @@ app.get('/instances', async c => {
 });
 
 app.get('/health', c => {
-return Response.json({ status: 'ok', version: '2.4.0', activeInstance, instanceHealthy, qobuzBase: activeQobuzInstance, cachedTracks: TRACK_META_CACHE.size, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
+return Response.json({ status: 'ok', version: '2.4.1', activeInstance, instanceHealthy, qobuzBase: activeQobuzInstance, cachedTracks: TRACK_META_CACHE.size, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
 });
 
 app.get('/u/:token/manifest.json', async c => {
