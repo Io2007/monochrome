@@ -52,6 +52,32 @@ function getCachedMeta(id) {
 return TRACK_META_CACHE.get(String(id)) || null;
 }
 
+// ─── Unified in-memory TTL cache ─────────────────────────────────────────────
+const _cache = new Map();
+function cGet(key) {
+  const v = _cache.get(key);
+  if (!v) return null;
+  if (v.exp && v.exp < Date.now()) { _cache.delete(key); return null; }
+  return v.val;
+}
+function cSet(key, val, ttlSec) {
+  _cache.set(key, { val, exp: ttlSec ? Date.now() + ttlSec * 1000 : null });
+  if (_cache.size > 2000) {
+    let del = Math.floor(_cache.size * 0.2);
+    for (const k of _cache.keys()) { if (del-- <= 0) break; _cache.delete(k); }
+  }
+}
+
+// ─── Inflight deduplication ───────────────────────────────────────────────────
+// Two simultaneous requests for the same stream share ONE outbound call.
+const _inflight = new Map();
+async function dedupeCall(key, fn) {
+  if (_inflight.has(key)) return _inflight.get(key);
+  const p = Promise.resolve().then(fn).finally(() => _inflight.delete(key));
+  _inflight.set(key, p);
+  return p;
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function coverUrl(uuid, size) {
 if (!uuid) return undefined;
@@ -114,108 +140,154 @@ return 0;
 }
 
 // ─── Qobuz client ─────────────────────────────────────────────────────────────
+// qobuzStream: races ALL (instance × format) combos in parallel — picks best quality winner.
+// Stream URLs are cached for 28 min (Qobuz URLs expire at 30 min).
 async function qobuzStream(trackId) {
-for (const inst of QOBUZ_INSTANCES) {
-for (const fmt of [27, 7, 6, 5]) {
-try {
-const r = await axios.get(inst + '/stream/' + trackId, {
-params: { format_id: fmt },
-headers: { 'User-Agent': UA },
-timeout: 12000
-});
-if (r.data && r.data.url) {
-if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-const quality = fmt === 27 ? 'hires-192' : fmt === 7 ? 'hires-96' : fmt === 6 ? 'lossless' : '320kbps';
-return { url: r.data.url, format: fmt !== 5 ? 'flac' : 'mp3', quality, source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1800 };
-}
-} catch(e) { continue; }
-}
-}
-return null;
+  const cacheKey = 'qstream:' + trackId;
+  const cached = cGet(cacheKey);
+  if (cached) return cached;
+
+  const fmtOrder = [27, 7, 6, 5]; // best → worst
+  const fmtQuality = { 27: 'hires-192', 7: 'hires-96', 6: 'lossless', 5: '320kbps' };
+  const fmtLabel   = { 27: 'flac',      7: 'flac',     6: 'flac',     5: 'mp3' };
+
+  const combos = [];
+  for (const inst of QOBUZ_INSTANCES)
+    for (const fmt of fmtOrder)
+      combos.push({ inst, fmt });
+
+  const results = await Promise.allSettled(combos.map(({ inst, fmt }) =>
+    axios.get(inst + '/stream/' + trackId, {
+      params: { format_id: fmt },
+      headers: { 'User-Agent': UA },
+      timeout: 10000
+    }).then(r => {
+      if (r.data && r.data.url) return { url: r.data.url, fmt, inst };
+      throw new Error('no url');
+    })
+  ));
+
+  // Pick highest-quality successful result
+  for (const fmt of fmtOrder) {
+    const hit = results.find(r => r.status === 'fulfilled' && r.value.fmt === fmt);
+    if (hit) {
+      const { url, inst } = hit.value;
+      if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
+      const result = {
+        url, format: fmtLabel[fmt], quality: fmtQuality[fmt],
+        source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1680
+      };
+      cSet(cacheKey, result, 1680); // cache for 28 min
+      return result;
+    }
+  }
+  return null;
 }
 
+// qobuzFindBestTrack: search result cached 1h — no more Qobuz search on every stream request.
+// Negative results (no match) cached 30 min to prevent hammering on unmatchable tracks.
 async function qobuzFindBestTrack(title, artist) {
-if (!title) return null;
-const q = (artist ? artist + ' ' : '') + title;
-for (const inst of QOBUZ_INSTANCES) {
-try {
-const r = await axios.get(inst + '/search', {
-params: { q, limit: 10 },
-headers: { 'User-Agent': UA },
-timeout: 12000
-});
-const data = r.data || null;
-if (!data) continue;
-const items = (data.tracks && data.tracks.items) ? data.tracks.items : [];
-if (!items.length) continue;
-const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-const wantTitle = norm(title);
-const wantArtist = norm(artist || '');
-const ranked = items.slice().sort((a, b) => {
-const score = item => {
-const t = norm(item.title || '');
-const ar = norm((item.performer && item.performer.name) || (item.artist && item.artist.name) || '');
-let s = 0;
-if (t === wantTitle) s += 5;
-if (wantArtist && ar === wantArtist) s += 5;
-if (wantTitle && t.includes(wantTitle)) s += 2;
-if (wantArtist && ar.includes(wantArtist)) s += 2;
-return s;
-};
-return score(b) - score(a);
-});
-const best = ranked[0];
-if (!best) continue;
-const bestTitle = norm(best.title || '');
-const bestArtist = norm((best.performer && best.performer.name) || (best.artist && best.artist.name) || '');
-const titleGood = wantTitle && (bestTitle === wantTitle || bestTitle.includes(wantTitle) || wantTitle.includes(bestTitle));
-const artistGood = !wantArtist || (bestArtist && (bestArtist === wantArtist || bestArtist.includes(wantArtist) || wantArtist.includes(bestArtist)));
-if (wantArtist ? (titleGood && artistGood) : titleGood) {
-if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-return best;
-}
-} catch(e) { continue; }
-}
-return null;
+  if (!title) return null;
+  const cacheKey = 'qmatch:' + title.toLowerCase() + ':' + (artist || '').toLowerCase();
+  const cached = cGet(cacheKey);
+  if (cached === 'MISS') return null;
+  if (cached) return cached;
+
+  const q = (artist ? artist + ' ' : '') + title;
+  for (const inst of QOBUZ_INSTANCES) {
+    try {
+      const r = await axios.get(inst + '/search', {
+        params: { q, limit: 10 },
+        headers: { 'User-Agent': UA },
+        timeout: 10000
+      });
+      const data = r.data || null;
+      if (!data) continue;
+      const items = (data.tracks && data.tracks.items) ? data.tracks.items : [];
+      if (!items.length) continue;
+      const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+      const wantTitle  = norm(title);
+      const wantArtist = norm(artist || '');
+      const ranked = items.slice().sort((a, b) => {
+        const score = item => {
+          const t  = norm(item.title || '');
+          const ar = norm((item.performer && item.performer.name) || (item.artist && item.artist.name) || '');
+          let s = 0;
+          if (t === wantTitle)              s += 5;
+          if (wantArtist && ar === wantArtist) s += 5;
+          if (wantTitle  && t.includes(wantTitle))   s += 2;
+          if (wantArtist && ar.includes(wantArtist)) s += 2;
+          return s;
+        };
+        return score(b) - score(a);
+      });
+      const best = ranked[0];
+      if (!best) continue;
+      const bestTitle  = norm(best.title || '');
+      const bestArtist = norm((best.performer && best.performer.name) || (best.artist && best.artist.name) || '');
+      const titleGood  = wantTitle && (bestTitle === wantTitle || bestTitle.includes(wantTitle) || wantTitle.includes(bestTitle));
+      const artistGood = !wantArtist || (bestArtist && (bestArtist === wantArtist || bestArtist.includes(wantArtist) || wantArtist.includes(bestArtist)));
+      if (wantArtist ? (titleGood && artistGood) : titleGood) {
+        if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
+        cSet(cacheKey, best, 3600); // cache match for 1 hour
+        return best;
+      }
+    } catch(e) { continue; }
+  }
+  cSet(cacheKey, 'MISS', 1800); // negative-cache misses for 30 min
+  return null;
 }
 
 // ─── Hi-Fi API client ─────────────────────────────────────────────────────────
+// Races ALL instances in parallel (Promise.any) — first success wins.
+// Eliminates the sequential 15s-per-instance fallback that caused retry storms.
 async function hifiGet(path, params) {
-var errors = [];
-var instances = instanceHealthy
-? [activeInstance].concat(HIFI_INSTANCES.filter(function(i) { return i !== activeInstance; }))
-: HIFI_INSTANCES.slice();
-for (var inst of instances) {
-try {
-var r = await axios.get(inst + path, { params: params, headers: { 'User-Agent': UA, 'Accept': 'application/json' }, timeout: 15000 });
-if (r.status === 200 && r.data) {
-if (inst !== activeInstance) { activeInstance = inst; instanceHealthy = true; }
-return r.data;
-}
-} catch(e) { errors.push(inst + ': ' + e.message); }
-}
-throw new Error('All Hi-Fi instances failed: ' + errors.slice(-2).join(', '));
+  const instances = instanceHealthy
+    ? [activeInstance].concat(HIFI_INSTANCES.filter(i => i !== activeInstance))
+    : HIFI_INSTANCES.slice();
+
+  try {
+    return await Promise.any(instances.map(inst =>
+      axios.get(inst + path, {
+        params,
+        headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+        timeout: 8000
+      }).then(r => {
+        if (r.status === 200 && r.data) {
+          if (inst !== activeInstance) { activeInstance = inst; instanceHealthy = true; }
+          return r.data;
+        }
+        throw new Error('bad response from ' + inst);
+      })
+    ));
+  } catch(e) {
+    throw new Error('All Hi-Fi instances failed');
+  }
 }
 
 async function hifiGetSafe(path, params) {
-try { return await hifiGet(path, params); } catch(e) { return null; }
+  try { return await hifiGet(path, params); } catch(e) { return null; }
 }
 
 async function hifiGetForToken(instanceUrl, path, params) {
-if (instanceUrl) {
-try {
-var r = await axios.get(instanceUrl + path, { params: params, headers: { 'User-Agent': UA, 'Accept': 'application/json' }, timeout: 15000 });
-if (r.status === 200 && r.data) return r.data;
-throw new Error('Non-200 from custom instance: ' + r.status);
-} catch(e) {
-throw new Error('Custom instance failed: ' + instanceUrl + ': ' + e.message);
-}
-}
-return hifiGet(path, params);
+  if (instanceUrl) {
+    try {
+      const r = await axios.get(instanceUrl + path, {
+        params,
+        headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+        timeout: 8000
+      });
+      if (r.status === 200 && r.data) return r.data;
+      throw new Error('Non-200 from custom instance: ' + r.status);
+    } catch(e) {
+      throw new Error('Custom instance failed: ' + instanceUrl + ': ' + e.message);
+    }
+  }
+  return hifiGet(path, params);
 }
 
 async function hifiGetForTokenSafe(instanceUrl, path, params) {
-try { return await hifiGetForToken(instanceUrl, path, params); } catch(e) { return null; }
+  try { return await hifiGetForToken(instanceUrl, path, params); } catch(e) { return null; }
 }
 
 // ─── Upstash Redis REST API ───────────────────────────────────────────────────
@@ -479,14 +551,17 @@ return Response.json({ token, manifestUrl: baseUrl + '/u/' + tokenSegment + '/ma
 });
 
 app.get('/instances', async c => {
-const results = await Promise.all(HIFI_INSTANCES.map(async inst => {
-const start = Date.now();
-try {
-await axios.get(inst + '/search', { params: { s: 'test', limit: 1 }, timeout: 6000 });
-return { url: inst, ok: true, ms: Date.now() - start };
-} catch(e) { return { url: inst, ok: false, ms: null }; }
-}));
-return Response.json({ instances: results });
+  const cached = cGet('instances:health');
+  if (cached) return Response.json({ instances: cached, cached: true });
+  const results = await Promise.all(HIFI_INSTANCES.map(async inst => {
+    const start = Date.now();
+    try {
+      await axios.get(inst + '/search', { params: { s: 'test', limit: 1 }, timeout: 6000 });
+      return { url: inst, ok: true, ms: Date.now() - start };
+    } catch(e) { return { url: inst, ok: false, ms: null }; }
+  }));
+  cSet('instances:health', results, 30); // cache 30s — prevents 12-req burst per poll
+  return Response.json({ instances: results });
 });
 
 app.get('/health', c => {
@@ -518,7 +593,10 @@ const inst = entry.instanceUrl;
 if (!q) return Response.json({ tracks: [], albums: [], artists: [], playlists: [] });
 
 const cacheKey = 'mc:search:' + (inst || 'pool') + ':' + q.toLowerCase() + ':' + limit;
-const cached = await upstashCmd('GET', cacheKey);
+  // In-memory cache check (fast path — avoids Upstash round-trip)
+  const memCached = cGet(cacheKey);
+  if (memCached) return Response.json(memCached);
+  const cached = await upstashCmd('GET', cacheKey);
 if (cached) {
 try {
 const parsed = JSON.parse(cached);
@@ -597,7 +675,8 @@ for (const p of [...(Array.isArray(plFromSearch) ? plFromSearch : []),
 }
 
 const result = { tracks, albums: Object.values(albumMap).slice(0, 8), artists: artistList, playlists: plItems };
-upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 300);
+  cSet(cacheKey, result, 300); // also cache in-memory for instant repeat hits
+  upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 300);
 return Response.json(result);
 } catch(e) {
 return Response.json({ error: 'Search failed: ' + e.message, tracks: [], albums: [], artists: [], playlists: [] }, { status: 502 });
@@ -611,6 +690,8 @@ return withToken(c, async entry => {
 const tid = c.req.param('id');
 const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
+
+return dedupeCall('stream:' + tid + ':' + (inst || 'pool'), async () => {
 
 // Step 1: title+artist from Eclipse query params (some clients send these)
 let qTitle = String(c.req.query('title') || '').trim();
@@ -678,6 +759,8 @@ if (qi === qualities.length - 1) return Response.json({ error: 'Could not get st
 }
 
 return Response.json({ error: 'No stream found for track ' + tid }, { status: 404 });
+}); // end dedupeCall
+
 });
 });
 
